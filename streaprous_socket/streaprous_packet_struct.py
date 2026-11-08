@@ -16,6 +16,16 @@ and efficient memoryview-based rdt_send data fragmentation.
 
 import socket
 import struct
+import random
+
+# ==========================================
+# RDT Protocol Constants & Flags
+# ==========================================
+SYN = 0x02
+ACK = 0x10
+FIN = 0x01
+DATA = 0x08
+SYN_ACK = SYN | ACK
 
 
 def pack_tcp_header(src_port, dst_port, seq, ack_seq, offset_res, flags, window, checksum, urg_ptr):
