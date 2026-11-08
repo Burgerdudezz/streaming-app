@@ -28,15 +28,6 @@ DATA = 0x08
 SYN_ACK = SYN | ACK
 
 
-<<<<<<< HEAD
-def pack_rdt_header(seq_num: int, ack_num: int, flags: int, checksum: int, rwnd: int, payload_len: int) -> bytes:
-    """Pack RDT 16-byte header using Big-Endian format !IIHHHH."""
-    return struct.pack(RDT_HEADER_FORMAT, seq_num, ack_num, flags, checksum, rwnd, payload_len)
-
-def unpack_rdt_header(header_bytes: bytes) -> dict:
-    """Unpack 16-byte RDT header into a Python dictionary."""
-    unpacked = struct.unpack(RDT_HEADER_FORMAT, header_bytes[:RDT_HEADER_SIZE])
-=======
 def pack_tcp_header(src_port, dst_port, seq, ack_seq, offset_res, flags, window, checksum, urg_ptr):
     """
     Stitches a structurally flawless 20-byte TCP header using Network Byte Order (!).
@@ -72,7 +63,6 @@ def unpack_tcp_header(tcp_packet_bytes):
         dict: Dictionary containing all unpacked TCP header fields
     """
     tcph = struct.unpack('!HHLLBBHHH', tcp_packet_bytes[:20])
->>>>>>> f44594965b6547c5cc6d1d300c69c49e2e44e6bb
     return {
         'src_port': tcph[0],
         'dst_port': tcph[1],
@@ -86,13 +76,6 @@ def unpack_tcp_header(tcp_packet_bytes):
         'data_offset': (tcph[4] >> 4) * 4  # Header length in bytes
     }
 
-<<<<<<< HEAD
-def compute_checksum(header_bytes: bytes, payload_bytes=b'') -> int:
-    """
-    Compute 16-bit Internet Checksum (RFC 1071) over header and payload.
-    Automatically pads with \x00 if total length is odd.
-    """
-=======
 
 def compute_tcp_checksum(src_ip, dst_ip, tcp_header_bytes, payload_bytes=b""):
     """
@@ -126,7 +109,6 @@ def compute_tcp_checksum(src_ip, dst_ip, tcp_header_bytes, payload_bytes=b""):
     )
     
     # Combine pseudo header, TCP header (with zero checksum), and payload
->>>>>>> f44594965b6547c5cc6d1d300c69c49e2e44e6bb
     if isinstance(payload_bytes, memoryview):
         payload_bytes = payload_bytes.tobytes()
         
@@ -148,28 +130,6 @@ def compute_tcp_checksum(src_ip, dst_ip, tcp_header_bytes, payload_bytes=b""):
     # One's complement
     return ~s & 0xffff
 
-<<<<<<< HEAD
-def chunk_and_pack_data(data, start_seq: int, mss: int = 1400) -> list:
-    """
-    Chunk large data using zero-copy memoryview and pack each chunk into 
-    complete RDT packets (Header + Payload) with correct checksums.
-    
-    Args:
-        data: str, bytes, bytearray, or memoryview to be chunked.
-        start_seq (int): Initial sequence number.
-        mss (int): Maximum Segment Size (default: 1400 bytes).
-        
-    Returns:
-        list of bytes: List of complete RDT packets ready for queueing/sending.
-    """
-    if isinstance(data, str):
-        data = data.encode('utf-8')
-    elif not isinstance(data, (bytes, bytearray, memoryview)):
-        data = bytes(data)
-        
-    data_mv = memoryview(data)
-    if len(data_mv) <= mss:
-=======
 
 def rdt_send(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, data, auto_chunk=True, mss=1460, flags=0x18, window=5840):
     """
@@ -203,48 +163,10 @@ def rdt_send(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, data, auto
     current_seq = seq
     
     if not auto_chunk or len(data_mv) <= mss:
->>>>>>> f44594965b6547c5cc6d1d300c69c49e2e44e6bb
         chunks = [data_mv]
     else:
         chunks = [data_mv[i:i + mss] for i in range(0, len(data_mv), mss)]
         
-<<<<<<< HEAD
-    packets = []
-    current_seq = start_seq
-    rwnd = 65535
-    flags = DATA
-    
-    for chunk in chunks:
-        chunk_bytes = chunk.tobytes()
-        payload_len = len(chunk_bytes)
-        draft_header = pack_rdt_header(current_seq, 0, flags, 0, rwnd, payload_len)
-        chksum = compute_checksum(draft_header, chunk_bytes)
-        final_header = pack_rdt_header(current_seq, 0, flags, chksum, rwnd, payload_len)
-        packets.append(final_header + chunk_bytes)
-        current_seq += payload_len
-        
-    return packets
-
-def rdt_send(udp_sock, dest_addr, data, seq_num=0, ack_num=0, flags=DATA, rwnd=65535, mss=1400):
-    """
-    Send data reliably over UDP using chunking and checksum calculation.
-    """
-    packets = chunk_and_pack_data(data, seq_num, mss)
-    total_sent = 0
-    current_seq = seq_num
-    
-    for pkt in packets:
-        header_bytes = pkt[:RDT_HEADER_SIZE]
-        payload_bytes = pkt[RDT_HEADER_SIZE:]
-        payload_len = len(payload_bytes)
-        
-        udp_sock.sendto(pkt, dest_addr)
-        total_sent += payload_len
-        current_seq += payload_len
-        
-    print(f'[UDP-RDT] Sent {len(packets)} chunk(s), total {total_sent} bytes, next_seq={current_seq} to {dest_addr}')
-    return total_sent, current_seq
-=======
     offset_res = (5 << 4) + 0
     urg_ptr = 0
     
@@ -281,4 +203,3 @@ def rdt_send(udp_sock, dest_addr, data, seq_num=0, ack_num=0, flags=DATA, rwnd=6
     print(f"[Streap_RDT] Sent {len(chunks)} chunk(s), total {total_sent} bytes, next_seq={current_seq}")
     return total_sent, current_seq
 
->>>>>>> f44594965b6547c5cc6d1d300c69c49e2e44e6bb
