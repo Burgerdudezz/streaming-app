@@ -1,3 +1,13 @@
+#
+# Copyright (C) 2026 pdnguyen of HCMC University of Technology VNU-HCM.
+# All rights reserved.
+# This file is part of the CO3093/CO3094 course,
+# and is released under the LICENSE. Please see the LICENSE
+# file that should have been included as part of this package.
+#
+# StreapRous release - UDP-RDT Unit Tests
+#
+
 import sys
 import os
 import unittest
@@ -8,64 +18,54 @@ import struct
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from streaprous_socket.streaprous_packet_struct import (
-    pack_tcp_header,
-    unpack_tcp_header,
-    compute_tcp_checksum,
-    rdt_send
+    pack_rdt_header,
+    unpack_rdt_header,
+    compute_checksum,
+    rdt_send,
+    RDT_HEADER_SIZE
 )
 
-class TestStreaprousPacketStruct(unittest.TestCase):
+class TestUDPRDT(unittest.TestCase):
     
-    def test_pack_and_unpack_tcp_header(self):
-        src_port = 12345
-        dst_port = 80
-        seq = 1000
-        ack_seq = 500
-        offset_res = (5 << 4) + 0
-        flags = 0x18  # PSH + ACK
-        window = 5840
+    def test_pack_and_unpack_rdt_header(self):
+        seq_num = 123456
+        ack_num = 654321
+        flags = 0x0001
         checksum = 0xABCD
-        urg_ptr = 0
+        rwnd = 65535
+        payload_len = 1400
         
-        packed = pack_tcp_header(src_port, dst_port, seq, ack_seq, offset_res, flags, window, checksum, urg_ptr)
-        self.assertEqual(len(packed), 20)
+        packed = pack_rdt_header(seq_num, ack_num, flags, checksum, rwnd, payload_len)
+        self.assertEqual(len(packed), RDT_HEADER_SIZE)
+        self.assertEqual(len(packed), 16)
         
-        unpacked = unpack_tcp_header(packed)
-        self.assertEqual(unpacked['src_port'], src_port)
-        self.assertEqual(unpacked['dst_port'], dst_port)
-        self.assertEqual(unpacked['seq'], seq)
-        self.assertEqual(unpacked['ack_seq'], ack_seq)
+        unpacked = unpack_rdt_header(packed)
+        self.assertEqual(unpacked['seq_num'], seq_num)
+        self.assertEqual(unpacked['ack_num'], ack_num)
         self.assertEqual(unpacked['flags'], flags)
-        self.assertEqual(unpacked['window'], window)
         self.assertEqual(unpacked['checksum'], checksum)
-        self.assertEqual(unpacked['data_offset'], 20)
+        self.assertEqual(unpacked['rwnd'], rwnd)
+        self.assertEqual(unpacked['payload_len'], payload_len)
 
-    def test_compute_tcp_checksum(self):
-        src_ip = "127.0.0.1"
-        dst_ip = "127.0.0.1"
-        src_port = 12345
-        dst_port = 80
-        seq = 1
-        ack_seq = 1
-        offset_res = 80  # 5 << 4
-        flags = 0x02  # SYN
-        window = 1024
-        urg_ptr = 0
+    def test_compute_internet_checksum(self):
+        seq_num = 1
+        ack_num = 1
+        flags = 0x0002
+        rwnd = 1024
+        payload = b'Hello UDP-RDT StreapRous'
         
-        header_draft = pack_tcp_header(src_port, dst_port, seq, ack_seq, offset_res, flags, window, 0, urg_ptr)
-        payload = b"Hello StreapRous"
+        header_draft = pack_rdt_header(seq_num, ack_num, flags, 0, rwnd, len(payload))
+        chk = compute_checksum(header_draft, payload)
         
-        chk = compute_tcp_checksum(src_ip, dst_ip, header_draft, payload)
         self.assertIsInstance(chk, int)
         self.assertTrue(0 <= chk <= 0xffff)
         
-        # Verify RFC 1071: computing checksum of pseudo + header (with checksum set) + payload should result in 0 (or 0xffff in one's complement check)
-        header_final = pack_tcp_header(src_port, dst_port, seq, ack_seq, offset_res, flags, window, chk, urg_ptr)
-        pseudo = socket.inet_aton(src_ip) + socket.inet_aton(dst_ip) + b'\x00' + bytes([socket.IPPROTO_TCP]) + struct.pack('!H', len(header_final) + len(payload))
-        total = pseudo + header_final + payload
+        header_final = pack_rdt_header(seq_num, ack_num, flags, chk, rwnd, len(payload))
+        total = header_final + payload
         
         if len(total) % 2 == 1:
             total += b'\x00'
+            
         s = 0
         for i in range(0, len(total), 2):
             s += struct.unpack('!H', total[i:i+2])[0]
@@ -73,27 +73,45 @@ class TestStreaprousPacketStruct(unittest.TestCase):
         s += (s >> 16)
         self.assertEqual(~s & 0xffff, 0)
 
-    def test_memoryview_fragmentation(self):
-        # Mock socket for rdt_send
-        class MockSocket:
+    def test_memoryview_fragmentation_and_rdt_send(self):
+        class MockUDPSocket:
             def __init__(self):
                 self.sent_packets = []
             def sendto(self, packet, addr):
                 self.sent_packets.append((packet, addr))
                 
-        sock = MockSocket()
-        large_data = b"A" * 4000  # 4000 bytes, larger than MSS=1460
+        sock = MockUDPSocket()
+        large_data = b'B' * 3500
         
         total_sent, next_seq = rdt_send(
-            sock, "127.0.0.1", "127.0.0.1", 5000, 80,
-            seq=100, ack_seq=0, data=large_data,
-            auto_chunk=True, mss=1460
+            sock, ('127.0.0.1', 9000), large_data,
+            seq_num=1000, ack_num=0, flags=0x0001, rwnd=65535, mss=1400
         )
         
-        self.assertEqual(total_sent, 4000)
-        self.assertEqual(next_seq, 100 + 4000)
-        self.assertEqual(len(sock.sent_packets), 3)  # 1460 + 1460 + 1080 = 4000 bytes
+        self.assertEqual(total_sent, 3500)
+        self.assertEqual(next_seq, 1000 + 3500)
+        self.assertEqual(len(sock.sent_packets), 3)
+        
+        pkt0, addr0 = sock.sent_packets[0]
+        self.assertEqual(addr0, ('127.0.0.1', 9000))
+        self.assertEqual(len(pkt0), 16 + 1400)
+        h0 = unpack_rdt_header(pkt0[:16])
+        self.assertEqual(h0['seq_num'], 1000)
+        self.assertEqual(h0['payload_len'], 1400)
+        self.assertEqual(pkt0[16:], b'B' * 1400)
+        
+        pkt1, _ = sock.sent_packets[1]
+        self.assertEqual(len(pkt1), 16 + 1400)
+        h1 = unpack_rdt_header(pkt1[:16])
+        self.assertEqual(h1['seq_num'], 1000 + 1400)
+        self.assertEqual(h1['payload_len'], 1400)
+        
+        pkt2, _ = sock.sent_packets[2]
+        self.assertEqual(len(pkt2), 16 + 700)
+        h2 = unpack_rdt_header(pkt2[:16])
+        self.assertEqual(h2['seq_num'], 1000 + 2800)
+        self.assertEqual(h2['payload_len'], 700)
+        self.assertEqual(pkt2[16:], b'B' * 700)
 
 if __name__ == '__main__':
     unittest.main()
-
