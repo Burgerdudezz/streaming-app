@@ -1,5 +1,5 @@
 from streaprous_socket.streaprous_raw_connection import (
-    connections, connections_lock, build_tcp_packet, pack_tcp_header, unpack_tcp_header, compute_tcp_checksum,conn_struct
+    connections, connections_lock, build_tcp_packet, build_ip_header, pack_tcp_header, unpack_tcp_header, compute_tcp_checksum,conn_struct
 )
 from streaprous_socket.streaprous_packet_dispatcher import get_packet_queue, remove_packet_queue
 
@@ -62,8 +62,8 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
             offset_res, flags, window, tcp_checksum, urg_ptr
         )
         
-        # 4-5. Assemble packet (UDP: the OS adds the IP header)
-        full_packet = tcp_header + chunk_bytes
+        ip_header = build_ip_header(src_ip, dest_ip, socket.IPPROTO_TCP, len(tcp_header) + len(chunk_bytes))
+        full_packet = ip_header + tcp_header + chunk_bytes
 
         # 6. Transmit over UDP
         timeout = 1.0  # Timeout in seconds
@@ -72,7 +72,7 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
         
 
         while True:
-            sock.sendto(full_packet, (dest_ip, dst_port))
+            sock.sendto(full_packet, (dest_ip, 0))
             dup_acks = 0
             print(f"[Streap_RDT] Sent chunk seq={current_seq}, waiting for ack={expected_ack}")
 
@@ -83,8 +83,9 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
                     packet, _ = pkt_queue.get(timeout=max(0, deadline - time.time()))
                 except queue.Empty:
                     break                                   # timer ran out
-
-                tcp = unpack_tcp_header(packet)
+                ihl = (packet[0] & 0x0F) * 4
+                tcp = unpack_tcp_header(packet[ihl:])
+                
                 if tcp['flags'] & 0x10:
                     if tcp['ack_seq'] >= expected_ack:
                         acked = True
@@ -149,8 +150,10 @@ def reliable_receive(s: socket.socket, conn_info: conn_struct) -> bytes:
                 packet, addr = packet_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
-
-            tcp_packet = packet  # UDP: no IP header in front
+            
+            
+            ihl = (packet[0] & 0x0F) * 4
+            tcp_packet = packet[ihl:]  
             
             if len(tcp_packet) < 20:
                 continue
@@ -190,9 +193,10 @@ def reliable_receive(s: socket.socket, conn_info: conn_struct) -> bytes:
             if fin_flag:
                 print(f"[Streap_raw] Received FIN from {client_ip}:{client_port}")
                 # Send ACK for FIN
+                header=build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP, 20)
                 ack_packet = build_tcp_packet(listen_ip, client_ip, listen_port, client_port,
                                               seq=session.server_seq, ack_seq=pkt_seq + 1, ack=1)
-                s.sendto(ack_packet, (client_ip, client_port))
+                s.sendto(header + ack_packet, (client_ip, 0))
 
                 with connections_lock:
                     if client_key in connections:
@@ -246,9 +250,10 @@ def reliable_receive(s: socket.socket, conn_info: conn_struct) -> bytes:
                         print(f"[Streap_RDT] Duplicate seq={pkt_seq}, ignored")
 
                     # Always ACK the next byte we want (cumulative ACK)
+                    header=build_ip_header(session.server_ip, client_ip, socket.IPPROTO_TCP, 20)
                     ack_packet = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port,
                                                   seq=session.server_seq, ack_seq=expected, ack=1)
-                    s.sendto(ack_packet, (client_ip, client_port))
+                    s.sendto(header + ack_packet, (client_ip, 0))
 
                     with connections_lock:
                         if client_key in connections:
