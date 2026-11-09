@@ -131,77 +131,7 @@ def compute_tcp_checksum(src_ip, dst_ip, tcp_header_bytes, payload_bytes=b""):
     return ~s & 0xffff
 
 
-def rdt_send(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, data, auto_chunk=True, mss=1460, flags=0x18, window=5840):
-    """
-    Flexible Reliable Data Transfer (RDT) send function with automatic data fragmentation
-    and memory optimization using memoryview.
-    
-    Args:
-        sock      (socket.socket): Raw socket instance
-        src_ip    (str): Source IP address
-        dest_ip   (str): Destination IP address
-        src_port  (int): Source port
-        dst_port  (int): Destination port
-        seq       (int): Initial sequence number
-        ack_seq   (int): Acknowledgement number
-        data      (bytes or bytearray): Data payload to transmit
-        auto_chunk(bool): If True, automatically fragment data into mss-sized chunks
-        mss       (int): Maximum Segment Size (default: 1460 bytes)
-        flags     (int): TCP flags (default: 0x18 -> PSH + ACK)
-        window    (int): TCP window size (default: 5840)
-        
-    Returns:
-        tuple: (total_sent, next_seq)
-    """
-    from streaprous_socket.streaprous_raw_connection import build_ip_header
-    
-    if not isinstance(data, (bytes, bytearray, memoryview)):
-        data = data.encode('utf-8') if isinstance(data, str) else bytes(data)
-        
-    data_mv = memoryview(data)
-    total_sent = 0
-    current_seq = seq
-    
-    if not auto_chunk or len(data_mv) <= mss:
-        chunks = [data_mv]
-    else:
-        chunks = [data_mv[i:i + mss] for i in range(0, len(data_mv), mss)]
-        
-    offset_res = (5 << 4) + 0
-    urg_ptr = 0
-    
-    for chunk in chunks:
-        chunk_bytes = chunk.tobytes()
-        
-        # 1. Build draft TCP header with checksum = 0
-        draft_tcp_header = pack_tcp_header(
-            src_port, dst_port, current_seq, ack_seq,
-            offset_res, flags, window, 0, urg_ptr
-        )
-        
-        # 2. Compute RFC 1071 Checksum with Pseudo-IP Header
-        tcp_checksum = compute_tcp_checksum(src_ip, dest_ip, draft_tcp_header, chunk_bytes)
-        
-        # 3. Build final TCP header with valid checksum
-        tcp_header = pack_tcp_header(
-            src_port, dst_port, current_seq, ack_seq,
-            offset_res, flags, window, tcp_checksum, urg_ptr
-        )
-        
-        # 4. Build IP header
-        ip_header = build_ip_header(src_ip, dest_ip, socket.IPPROTO_TCP, len(tcp_header) + len(chunk_bytes))
-        
-        # 5. Assemble full packet
-        full_packet = ip_header + tcp_header + chunk_bytes
-        
-        # 6. Transmit via Raw Socket
-        sock.sendto(full_packet, (dest_ip, 0))
-        
-        total_sent += len(chunk_bytes)
-        current_seq += len(chunk_bytes)
-        
-    print(f"[Streap_RDT] Sent {len(chunks)} chunk(s), total {total_sent} bytes, next_seq={current_seq}")
-    return total_sent, current_seq
+
 
 
 # ==========================================

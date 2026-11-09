@@ -33,6 +33,7 @@ conn_struct = namedtuple('conn_struct', [
 
 connections = {}
 connections_lock = threading.Lock()
+DEFAULT_INTERFACE_NAME = "127.0.0.1"
 DEFAULT_LISTEN_IP = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 22239
 
