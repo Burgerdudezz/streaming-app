@@ -21,11 +21,6 @@ import random
 from collections import namedtuple
 
 from .streaprous_packet_struct import (
-    SYN, ACK, FIN, DATA, SYN_ACK,
-    pack_rdt_header, unpack_rdt_header,
-    compute_checksum, chunk_and_pack_data, RDT_HEADER_SIZE,
-    rdt_send,
-    # TCP Header API (used by streaprous_reliability.py)
     pack_tcp_header, unpack_tcp_header, compute_tcp_checksum
 )
 
@@ -175,36 +170,28 @@ def checksum(data: bytes) -> int:
     return ~s & 0xffff
 
 
-def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, ack=0, fin=0):
-    """Build a 20-byte TCP header with RFC 1071 checksum."""
-    flags = (ack << 4) + (syn << 1) + fin
+def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, ack=0, fin=0, psh=0, payload=b''):
+    """Build a 20-byte TCP header with RFC 1071 checksum (including payload)."""
+    flags = (ack << 4) + (syn << 1) + fin + (psh << 3)
     offset_res = (5 << 4) + 0  # 20 bytes data offset (5 * 4)
     window = 5840
     urg_ptr = 0
     draft_checksum = 0
 
-    # Build a draft (20 byte) header with no checksum
-    tcp_header_temp = struct.pack('!HHLLBBHHH',
+    # Build draft header with 0 checksum using pack_tcp_header
+    draft_header = pack_tcp_header(
         src_port, dst_port, seq, ack_seq,
         offset_res, flags, window, draft_checksum, urg_ptr
     )
 
-    # Build pseudo-header for checksum
-    address_header = struct.pack('!4s4sBBH',
-        socket.inet_aton(src_ip), socket.inet_aton(dest_ip),
-        0, socket.IPPROTO_TCP, len(tcp_header_temp)
-    )
+    # Compute TCP Checksum with Pseudo-Header and payload
+    tcp_checksum = compute_tcp_checksum(src_ip, dest_ip, draft_header, payload)
 
-    # Calculate mathematical checksum integer
-    tcp_checksum = checksum(address_header + tcp_header_temp)
-
-    # Build the final TCP packet
-    tcp_header = struct.pack('!HHLLBBHHH',
+    # Build final TCP header
+    return pack_tcp_header(
         src_port, dst_port, seq, ack_seq,
         offset_res, flags, window, tcp_checksum, urg_ptr
     )
-
-    return tcp_header
 
 
 def build_ip_header(src_ip, dest_ip, protocol, payload_len):
@@ -253,11 +240,46 @@ def send_tcp_data_segment(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_se
     Build and send a TCP data segment (IP + TCP headers + payload) via raw socket.
     Used by streaprous_reliability.reliable_send.
     """
-    tcp_header = build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, ack=1, psh=psh)
+    tcp_header = build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, ack=1, psh=psh, payload=payload)
     ip_header = build_ip_header(src_ip, dest_ip, socket.IPPROTO_TCP, len(tcp_header) + len(payload))
     full_packet = ip_header + tcp_header + payload
     sock.sendto(full_packet, (dest_ip, 0))
     return len(payload)
+
+
+def run_conn_recv(sock: socket.socket, conn_info: conn_struct) -> bytes:
+    """Wrapper utilizing teammate's reliable_receive for raw TCP sockets."""
+    return reliable_receive(sock, conn_info)
+
+
+def run_conn_send(sock: socket.socket, conn_info: conn_struct, payload: bytes) -> int:
+    """Wrapper utilizing teammate's reliable_send for raw TCP sockets."""
+    return reliable_send(
+        sock, conn_info.server_ip, conn_info.client_ip,
+        conn_info.server_port, conn_info.client_port,
+        seq=conn_info.server_seq, ack_seq=conn_info.client_seq,
+        payload=payload
+    )
+
+
+def close_connection(sock: socket.socket, conn_info: conn_struct):
+    """Close connection by sending FIN segment."""
+    try:
+        tcp_header = build_tcp_packet(
+            conn_info.server_ip, conn_info.client_ip,
+            conn_info.server_port, conn_info.client_port,
+            conn_info.server_seq, conn_info.client_seq,
+            ack=1, fin=1, psh=1, payload=b''
+        )
+        ip_header = build_ip_header(
+            conn_info.server_ip, conn_info.client_ip,
+            socket.IPPROTO_TCP, len(tcp_header)
+        )
+        sock.sendto(ip_header + tcp_header, (conn_info.client_ip, 0))
+    except Exception as e:
+        print(f"[Raw-Connection] Error closing connection: {e}")
+    finally:
+        remove_packet_queue(conn_info.client_key if hasattr(conn_info, 'client_key') else f"{conn_info.client_ip}:{conn_info.client_port}")
 
 
 def accept(sock: socket.socket, timeout: float = 5.0) -> tuple:

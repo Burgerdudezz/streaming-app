@@ -17,7 +17,7 @@ import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from streaprous_socket.streaprous_raw_connection import (
+from streaprous_socket.streaprous_legacy import (
     create_udp_socket,
     connect_udp_handshake,
     accept_udp_handshake,
