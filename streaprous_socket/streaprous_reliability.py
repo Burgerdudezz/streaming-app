@@ -1,8 +1,7 @@
 from streaprous_socket.streaprous_raw_connection import (
-    connections, connections_lock, build_tcp_packet, build_ip_header, pack_tcp_header, unpack_tcp_header, compute_tcp_checksum,conn_struct
+    connections, connections_lock, conn_struct,
+    send_tcp_data_segment, get_packet_queue, remove_packet_queue
 )
-from streaprous_socket.streaprous_packet_dispatcher import get_packet_queue, remove_packet_queue
-
 import socket
 import struct
 import time
@@ -47,25 +46,10 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
     for chunk in chunks:
         chunk_bytes = chunk.tobytes()
         
-        # 1. Build draft TCP header with checksum = 0
-        draft_tcp_header = pack_tcp_header(
-            src_port, dst_port, current_seq, ack_seq,
-            offset_res, flags, window, 0, urg_ptr
-        )
-        
-        # 2. Compute RFC 1071 Checksum with Pseudo-IP Header
-        tcp_checksum = compute_tcp_checksum(src_ip, dest_ip, draft_tcp_header, chunk_bytes)
-        
-        # 3. Build final TCP header with valid checksum
-        tcp_header = pack_tcp_header(
-            src_port, dst_port, current_seq, ack_seq,
-            offset_res, flags, window, tcp_checksum, urg_ptr
-        )
-        
-        ip_header = build_ip_header(src_ip, dest_ip, socket.IPPROTO_TCP, len(tcp_header) + len(chunk_bytes))
-        full_packet = ip_header + tcp_header + chunk_bytes
+        # 1-5. Assemble and send via Raw Socket
+        send_tcp_data_segment(sock, src_ip, dest_ip, src_port, dst_port, current_seq, ack_seq, chunk_bytes, psh=1)
 
-        # 6. Transmit over UDP
+        # 6. Transmit (already sent via send_tcp_data_segment)
         timeout = 1.0  # Timeout in seconds
         expected_ack = current_seq + len(chunk_bytes)   # client should reply with this
         retries = 0

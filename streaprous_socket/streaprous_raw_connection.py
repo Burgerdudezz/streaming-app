@@ -23,7 +23,22 @@ from collections import namedtuple
 from .streaprous_packet_struct import (
     SYN, ACK, FIN, DATA, SYN_ACK,
     pack_rdt_header, unpack_rdt_header,
-    compute_checksum, rdt_send, RDT_HEADER_SIZE
+    compute_checksum, chunk_and_pack_data, RDT_HEADER_SIZE,
+    rdt_send,
+    # TCP Header API (used by streaprous_reliability.py)
+    pack_tcp_header, unpack_tcp_header, compute_tcp_checksum
+)
+
+# ==========================================
+# Import from CO3094 Packet Dispatcher (Raw Socket Receive Infrastructure)
+# ==========================================
+from .streaprous_packet_dispatcher import (
+    start_packet_dispatcher,
+    stop_packet_dispatcher,
+    get_packet_queue,
+    remove_packet_queue,
+    _packet_dispatcher_lock,
+    _SYN_KEY
 )
 
 conn_struct = namedtuple('conn_struct', [
@@ -33,6 +48,7 @@ conn_struct = namedtuple('conn_struct', [
 
 connections = {}
 connections_lock = threading.Lock()
+DEFAULT_INTERFACE_NAME = "127.0.0.1"
 DEFAULT_LISTEN_IP = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 22239
 
@@ -138,3 +154,132 @@ def close_connection(s: socket.socket, conn_info: conn_struct):
 def close_all_connections():
     with connections_lock:
         connections.clear()
+
+
+# ==========================================
+# TCP/IP Raw Socket Support Functions
+# Added for compatibility with streaprous_packet_struct.rdt_send
+# and streaprous_reliability.reliable_send
+# ==========================================
+
+def checksum(data: bytes) -> int:
+    """Compute Internet checksum (RFC 1071)."""
+    if len(data) % 2 == 1:
+        data += b'\x00'
+    s = 0
+    for i in range(0, len(data), 2):
+        w = struct.unpack('!H', data[i:i+2])[0]
+        s += w
+    s = (s >> 16) + (s & 0xffff)
+    s += (s >> 16)
+    return ~s & 0xffff
+
+
+def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, ack=0, fin=0):
+    """Build a 20-byte TCP header with RFC 1071 checksum."""
+    flags = (ack << 4) + (syn << 1) + fin
+    offset_res = (5 << 4) + 0  # 20 bytes data offset (5 * 4)
+    window = 5840
+    urg_ptr = 0
+    draft_checksum = 0
+
+    # Build a draft (20 byte) header with no checksum
+    tcp_header_temp = struct.pack('!HHLLBBHHH',
+        src_port, dst_port, seq, ack_seq,
+        offset_res, flags, window, draft_checksum, urg_ptr
+    )
+
+    # Build pseudo-header for checksum
+    address_header = struct.pack('!4s4sBBH',
+        socket.inet_aton(src_ip), socket.inet_aton(dest_ip),
+        0, socket.IPPROTO_TCP, len(tcp_header_temp)
+    )
+
+    # Calculate mathematical checksum integer
+    tcp_checksum = checksum(address_header + tcp_header_temp)
+
+    # Build the final TCP packet
+    tcp_header = struct.pack('!HHLLBBHHH',
+        src_port, dst_port, seq, ack_seq,
+        offset_res, flags, window, tcp_checksum, urg_ptr
+    )
+
+    return tcp_header
+
+
+def build_ip_header(src_ip, dest_ip, protocol, payload_len):
+    """Build a 20-byte IP header with checksum."""
+    version_ihl = (4 << 4) | 5  # Version 4, IHL 5 (20 bytes)
+    tos = 0
+    total_len = 20 + payload_len  # IP header + payload
+
+    identification = 0x1234
+    flags_fragment = 0x4000
+    flags_offset = 0
+    ttl = 64
+    draft_checksum = 0
+
+    # Build draft header with no checksum
+    ip_header_temp = struct.pack('!BBHHHBBH4s4s',
+        version_ihl, tos, total_len, identification,
+        flags_offset, ttl, protocol, draft_checksum,
+        socket.inet_aton(src_ip), socket.inet_aton(dest_ip)
+    )
+
+    # Calculate the checksum
+    ip_checksum = checksum(ip_header_temp)
+
+    # Build the final IP header
+    ip_header = struct.pack('!BBHHHBBH4s4s',
+        version_ihl, tos, total_len, identification,
+        flags_offset, ttl, protocol, ip_checksum,
+        socket.inet_aton(src_ip), socket.inet_aton(dest_ip)
+    )
+
+    return ip_header
+
+
+def create_raw_socket() -> socket.socket:
+    """
+    Create a raw socket for TCP protocol. Requires root/admin privileges.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    return sock
+
+
+def send_tcp_data_segment(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, payload, psh=1):
+    """
+    Build and send a TCP data segment (IP + TCP headers + payload) via raw socket.
+    Used by streaprous_reliability.reliable_send.
+    """
+    tcp_header = build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, ack=1, psh=psh)
+    ip_header = build_ip_header(src_ip, dest_ip, socket.IPPROTO_TCP, len(tcp_header) + len(payload))
+    full_packet = ip_header + tcp_header + payload
+    sock.sendto(full_packet, (dest_ip, 0))
+    return len(payload)
+
+
+def accept(sock: socket.socket, timeout: float = 5.0) -> tuple:
+    """Accept a connection on a raw socket (simplified)."""
+    sock.settimeout(timeout)
+    try:
+        pkt, addr = sock.recvfrom(65535)
+        # Parse IP header to get source
+        ihl = (pkt[0] & 0x0F) * 4
+        tcp_pkt = pkt[ihl:]
+        if len(tcp_pkt) >= 20:
+            tcph = struct.unpack('!HHLLBBHHH', tcp_pkt[:20])
+            src_port, dst_port, seq, ack_seq, flags = tcph[0], tcph[1], tcph[2], tcph[3], tcph[5]
+            # Return connection info
+            conn = conn_struct(addr[0], src_port, addr[0], dst_port, "ESTABLISHED", seq, ack_seq, ack_seq, time.time())
+            return conn, addr
+    except socket.timeout:
+        pass
+    return None, None
+
+
+
+
+
+
