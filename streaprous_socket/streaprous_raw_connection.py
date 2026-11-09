@@ -23,7 +23,8 @@ from collections import namedtuple
 from .streaprous_packet_struct import (
     SYN, ACK, FIN, DATA, SYN_ACK,
     pack_rdt_header, unpack_rdt_header,
-    compute_checksum, rdt_send, RDT_HEADER_SIZE
+    compute_checksum, rdt_send, RDT_HEADER_SIZE,
+    pack_tcp_header, unpack_tcp_header, compute_tcp_checksum
 )
 
 conn_struct = namedtuple('conn_struct', [

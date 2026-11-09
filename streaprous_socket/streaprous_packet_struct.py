@@ -253,17 +253,21 @@ def chunk_and_pack_data(data, start_seq=0, mss=1400):
 def rdt_send(sock, arg1, arg2, arg3=None, arg4=None, *args, **kwargs):
     """
     Flexible RDT send function supporting both old UDP API and new raw socket API.
+    Delegates raw socket sending to friend's reliable_send for full RDT reliability (timeouts, retransmissions).
     
     Old UDP API (backward compatible):
         rdt_send(sock, dest_addr, data, seq_num=0, ack_num=0)
         
     New Raw Socket API (for TCP-style):
         rdt_send(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, data, 
-                 auto_chunk=True, mss=1460, flags=0x18, window=5840)
+                 auto_chunk=True, mss=1460, flags=0x18, window=5840, reliable=False)
     """
     # Check if this is the new raw socket API:
     # arg1 is src_ip (str), arg2 is dest_ip (str), arg3 is src_port (int), etc.
     if isinstance(arg1, str) and isinstance(arg2, str) and isinstance(arg3, int):
+        # Check if caller wants reliability (opt-in, default False for backward compat with tests)
+        reliable = kwargs.pop('reliable', False)
+        
         src_ip = arg1
         dest_ip = arg2
         src_port = arg3
@@ -274,7 +278,14 @@ def rdt_send(sock, arg1, arg2, arg3=None, arg4=None, *args, **kwargs):
         if data is None and args:
             data = args[0]
             args = args[1:]
-        return _rdt_send_raw(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, data, *args, **kwargs)
+        
+        if reliable:
+            # Use friend's reliable_send with full RDT reliability
+            from streaprous_socket.streaprous_reliability import reliable_send
+            return reliable_send(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, data, *args, **kwargs)
+        else:
+            # Legacy behavior: send without waiting for ACKs (for testing/backward compat)
+            return _rdt_send_raw_legacy(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, data, *args, **kwargs)
     
     # Otherwise, old UDP API
     dest_addr = arg1
@@ -299,9 +310,10 @@ def rdt_send(sock, arg1, arg2, arg3=None, arg4=None, *args, **kwargs):
     return len(data), seq_num + payload_len
 
 
-def _rdt_send_raw(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, data, auto_chunk=True, mss=1460, flags=0x18, window=5840):
+def _rdt_send_raw_legacy(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, data, auto_chunk=True, mss=1460, flags=0x18, window=5840):
     """
-    New TCP-style RDT send for raw sockets with IP+TCP headers.
+    Legacy TCP-style RDT send for raw sockets with IP+TCP headers (without ACK waiting).
+    Used for testing and backward compatibility.
     
     Args:
         sock      (socket.socket): Raw socket instance (SOCK_RAW)
@@ -361,7 +373,7 @@ def _rdt_send_raw(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, data,
         # 5. Assemble full packet
         full_packet = ip_header + tcp_header + chunk_bytes
         
-        # 6. Transmit via Raw Socket
+        # 6. Transmit via Raw Socket (no ACK waiting)
         sock.sendto(full_packet, (dest_ip, 0))
         
         total_sent += len(chunk_bytes)
