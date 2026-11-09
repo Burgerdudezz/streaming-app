@@ -249,6 +249,45 @@ def chunk_and_pack_data(data, start_seq=0, mss=1400):
     return packets
 
 
+def rdt_send(sock, arg1, arg2, arg3=None, arg4=None, *args, **kwargs):
+    """
+    Unified Facade for rdt_send:
+    - UDP API: rdt_send(sock, dest_addr, data, seq_num=0, ack_num=0)
+    - Raw Socket Reliable API: rdt_send(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, data, reliable=False, ...)
+    """
+    if isinstance(arg1, str) and isinstance(arg2, str) and isinstance(arg3, int):
+        # Raw Socket / Reliable path
+        reliable = kwargs.pop('reliable', False)
+        src_ip, dest_ip, src_port, dst_port = arg1, arg2, arg3, arg4
+        seq = kwargs.pop('seq', 0)
+        ack_seq = kwargs.pop('ack_seq', 0)
+        data = kwargs.pop('data', args[0] if args else b'')
+        
+        if reliable:
+            from .streaprous_reliability import reliable_send
+            return reliable_send(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, data, *args, **kwargs)
+        else:
+            from .streaprous_raw_connection import send_tcp_data_segment
+            return send_tcp_data_segment(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, data)
+    else:
+        # UDP Legacy path: arg1 = dest_addr (tuple), arg2 = data (bytes), arg3 = seq_num, arg4 = ack_num
+        dest_addr = arg1
+        data = arg2
+        seq_num = arg3 if arg3 is not None else 0
+        ack_num = arg4 if arg4 is not None else 0
+        
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            data = data.encode('utf-8') if isinstance(data, str) else bytes(data)
+            
+        header = pack_rdt_header(seq_num, ack_num, DATA, 0, 65535, len(data))
+        checksum_val = compute_checksum(header + bytes(data))
+        header = pack_rdt_header(seq_num, ack_num, DATA, checksum_val, 65535, len(data))
+        
+        packet = header + bytes(data)
+        sock.sendto(packet, dest_addr)
+        return len(data)
+
+
 # Backward compatible rdt_send with old API (used by streaprous_raw_connection.py)
 def rdt_send(sock, arg1, arg2, arg3=None, arg4=None, *args, **kwargs):
     """

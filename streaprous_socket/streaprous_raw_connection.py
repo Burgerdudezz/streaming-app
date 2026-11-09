@@ -23,8 +23,22 @@ from collections import namedtuple
 from .streaprous_packet_struct import (
     SYN, ACK, FIN, DATA, SYN_ACK,
     pack_rdt_header, unpack_rdt_header,
-    compute_checksum, rdt_send, RDT_HEADER_SIZE,
+    compute_checksum, chunk_and_pack_data, RDT_HEADER_SIZE,
+    rdt_send,
+    # TCP Header API (used by streaprous_reliability.py)
     pack_tcp_header, unpack_tcp_header, compute_tcp_checksum
+)
+
+# ==========================================
+# Import from CO3094 Packet Dispatcher (Raw Socket Receive Infrastructure)
+# ==========================================
+from .streaprous_packet_dispatcher import (
+    start_packet_dispatcher,
+    stop_packet_dispatcher,
+    get_packet_queue,
+    remove_packet_queue,
+    _packet_dispatcher_lock,
+    _SYN_KEY
 )
 
 conn_struct = namedtuple('conn_struct', [
@@ -232,6 +246,18 @@ def create_raw_socket() -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
     return sock
+
+
+def send_tcp_data_segment(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, payload, psh=1):
+    """
+    Build and send a TCP data segment (IP + TCP headers + payload) via raw socket.
+    Used by streaprous_reliability.reliable_send.
+    """
+    tcp_header = build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, ack=1, psh=psh)
+    ip_header = build_ip_header(src_ip, dest_ip, socket.IPPROTO_TCP, len(tcp_header) + len(payload))
+    full_packet = ip_header + tcp_header + payload
+    sock.sendto(full_packet, (dest_ip, 0))
+    return len(payload)
 
 
 def accept(sock: socket.socket, timeout: float = 5.0) -> tuple:
