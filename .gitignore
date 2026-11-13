@@ -53,3 +53,7 @@ cover/
 *.swp
 *.swo
 *~
+
+reading-guide/
+scripts/
+.github/

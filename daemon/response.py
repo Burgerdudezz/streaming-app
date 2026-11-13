@@ -183,6 +183,7 @@ class Response():
         #        video/mpeg
         #        ...
         #
+        
         else:
             raise ValueError("Invalid MEME type: main_type={} sub_type={}".format(main_type,sub_type))
 
@@ -294,7 +295,8 @@ class Response():
         elif mime_type == 'application/json' or mime_type == 'application/octet-stream':
             base_dir = self.prepare_content_type(mime_type = 'application/json')
             envelop_content = ""
-
+        elif mime_type.startswith('image/'):
+            base_dir = self.prepare_content_type(mime_type=mime_type)
         #
         # TODO: add support objects
         #
