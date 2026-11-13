@@ -9,6 +9,7 @@ from streaprous_socket.streaprous_packet_dispatcher import get_packet_queue, rem
 from streaprous_socket.streaprous_flow_control import (
     RCV_BUF, flow, usable, probe_gave_up, should_probe, PROBE_INTERVAL, current_rwnd, classify, rwnd
 )
+from collections import deque
 
 import socket
 import struct
@@ -42,9 +43,8 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
     total_sent = 0
     current_seq = seq
     pkt_queue= get_packet_queue((dest_ip, dst_port))  # Retrieve the global packet queue
-    
-    #Legacy version used chunk, changed to active rwnd
-    
+    send_queue = deque() 
+    oldest_unacked= seq
     key = (dest_ip, dst_port)
     offset = 0
     offset_res = (5 << 4) + 0
@@ -57,9 +57,13 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
         hdr = pack_tcp_header(src_port, dst_port, seq_no, ack_seq, offset_res, flags, rcv_wnd, csum, urg_ptr)
         return build_ip_header(src_ip, dest_ip, socket.IPPROTO_TCP, len(hdr) + len(data)) + hdr + data
 
-    while offset < len(data_mv):                                  
-        can = usable(flow[key]["peer_rwnd"], float("inf"), current_seq, current_seq)
-        if can == 0:
+    timeout = 1.0  # Timeout in second
+    retries = 0
+    dup_acks = 0
+    deadline = time.time() + timeout
+    while offset < len(data_mv) or send_queue:                             
+        can = usable(flow[key]["peer_rwnd"], float("inf"), current_seq, oldest_unacked)
+        if can == 0 and not send_queue: 
             st = flow[key]
             while st["peer_rwnd"] == 0:
                 if probe_gave_up(st["unanswered_probes"]):
@@ -84,64 +88,62 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
                     offset += 1
                     total_sent += 1
                     current_seq += 1
+                    oldest_unacked = current_seq
                 continue  
             continue
-                
-        size = min(mss, can, len(data_mv) - offset)
-        chunk_bytes = data_mv[offset:offset + size].tobytes()
+        if offset < len(data_mv) and can > 0:        
+            size = min(mss, can, len(data_mv) - offset)
+            chunk_bytes = data_mv[offset:offset + size].tobytes()
 
-        offset += size
-        
-        full_packet = make_segment(current_seq, chunk_bytes)
-
-        # 6. Transmit over UDP
-        timeout = 1.0  # Timeout in seconds
-        expected_ack = current_seq + len(chunk_bytes)   # client should reply with this
-        retries = 0
-        
-
-        while True:
+            offset += size
+            
+            full_packet = make_segment(current_seq, chunk_bytes)
             sock.sendto(full_packet, (dest_ip, 0))
-            dup_acks = 0
-            print(f"[Streap_RDT] Sent chunk seq={current_seq}, waiting for ack={expected_ack}")
+            send_queue.append((current_seq,full_packet, len(chunk_bytes)))
+            total_sent += len(chunk_bytes)
+            current_seq += len(chunk_bytes)
 
-            acked = False
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                try:
-                    packet, _ = pkt_queue.get(timeout=max(0, deadline - time.time()))
-                except queue.Empty:
-                    break                                   # timer ran out
-                ihl = (packet[0] & 0x0F) * 4
-                tcp = unpack_tcp_header(packet[ihl:])
-                
-                st = flow[key]
-                st["peer_rwnd"] = tcp['window']
-                st["unanswered_probes"] = 0
-                            
-                if tcp['flags'] & 0x10:
-                    if tcp['ack_seq'] >= expected_ack:
-                        acked = True
-                        break
-                if tcp['ack_seq'] == current_seq:      # client still asking for this chunk
-                    dup_acks += 1
-                    if dup_acks >= 3:
-                        print(f"[Streap_RDT] 3 dup ACKs for seq={current_seq}, fast retransmit")
-                        break                           # leave early -> outer loop resends
+            if len(send_queue) == 1:
+                    deadline = time.time() + timeout
+            continue
+        if send_queue:
+            try:
+                packet, _ = pkt_queue.get(timeout=max(0, deadline - time.time()))
+            except queue.Empty:
+                if retries > 10:
+                    raise ConnectionError(f"no ACK for seq={send_queue[0][0]} after 10 retries")
+                print(f"[Streap_RDT] Timeout for seq={send_queue[0][0]}, resending...")
+                dup_acks = 0
+                sock.sendto(send_queue[0][1], (dest_ip, 0))
+                retries += 1
+                deadline = time.time() + timeout
+                continue                                   # timer ran out
+            ihl = (packet[0] & 0x0F) * 4
+            tcp = unpack_tcp_header(packet[ihl:])
+            
+            st = flow[key]
+            st["peer_rwnd"] = tcp['window']
+            st["unanswered_probes"] = 0
+                        
+            if tcp['ack_seq'] > oldest_unacked:      # client acked some data
+                while send_queue and send_queue[0][0]+send_queue[0][2] <= tcp['ack_seq']: 
+                    send_queue.popleft()
+                retries = 0
+                oldest_unacked = tcp['ack_seq']
+                dup_acks = 0
+                deadline = time.time() + timeout
+                continue                                
 
-                # any other packet (old ACK, etc.): ignore and keep waiting
+            if tcp['ack_seq'] == oldest_unacked:      # client still asking for this chunk
+                dup_acks += 1
+                if dup_acks == 3:
+                    print(f"[Streap_RDT] 3 dup ACKs for seq={send_queue[0][0]}, fast retransmit")
+                    sock.sendto(send_queue[0][1], (dest_ip, 0))
+                    deadline = time.time() + timeout
+                    continue
 
-            if acked:
-                break
+            # any other packet (old ACK, etc.): ignore and keep waiting
 
-            retries += 1
-            if retries > 10:
-                raise ConnectionError(f"no ACK for seq={current_seq} after 10 retries")
-            #print(f"[Streap_RDT] Timeout for seq={current_seq}, resending ({retries})")
-
-        total_sent += len(chunk_bytes)
-        current_seq += len(chunk_bytes)
-        
     print(f"[Streap_RDT] Sent {total_sent} bytes, next_seq={current_seq}")
     return total_sent, current_seq
             
