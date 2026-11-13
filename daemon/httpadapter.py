@@ -191,6 +191,7 @@ class HttpAdapter:
         #
         # TODO run_conn_send packet
         # run_conn_send(..)
+        run_conn_send(raw_socket, conn_info, response)
         
         # Wait longer to ensure response is transmitted, client processes it, and sends ACK
         import time
@@ -200,6 +201,7 @@ class HttpAdapter:
         #
         # TODO run_conn_send packet
         # close_connection(...)
+        close_connection(raw_socket, conn_info)
 
     async def handle_client_coroutine(self, reader, writer):
         """

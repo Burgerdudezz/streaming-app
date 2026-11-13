@@ -1,7 +1,14 @@
 from streaprous_socket.streaprous_raw_connection import (
-    connections, connections_lock, build_tcp_packet, build_ip_header, pack_tcp_header, unpack_tcp_header, compute_tcp_checksum,conn_struct
+    connections, connections_lock, build_tcp_packet, build_ip_header, conn_struct
+)
+from streaprous_socket.streaprous_packet_struct import (
+    pack_tcp_header, unpack_tcp_header, compute_tcp_checksum
 )
 from streaprous_socket.streaprous_packet_dispatcher import get_packet_queue, remove_packet_queue
+
+from streaprous_socket.streaprous_flow_control import (
+    RCV_BUF, flow, usable, probe_gave_up, should_probe, PROBE_INTERVAL, current_rwnd, classify, rwnd
+)
 
 import socket
 import struct
@@ -10,7 +17,7 @@ import queue
 from collections import namedtuple
 reorder_buffers = {} 
 def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
-        payload, auto_chunk=True, mss=1460, flags=0x18, window=5840):
+        payload, auto_chunk=True, mss=1460, flags=0x18, rcv_wnd=RCV_BUF):
     """sends data reliably over a TCP-like connection using a custom implementation of the TCP protocol.
     Args:
             sock      (socket.socket): Raw socket instance
@@ -24,7 +31,7 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
             auto_chunk(bool): If True, automatically fragment data into mss-sized chunks
             mss       (int): Maximum Segment Size (default: 1460 bytes)
             flags     (int): TCP flags (default: 0x18 -> PSH + ACK)
-            window    (int): TCP window size (default: 5840)
+            window    (int): TCP window size
             
         Returns:
             tuple: (total_sent, next_seq)"""
@@ -35,35 +42,57 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
     total_sent = 0
     current_seq = seq
     pkt_queue= get_packet_queue((dest_ip, dst_port))  # Retrieve the global packet queue
-
-    if not auto_chunk or len(data_mv) <= mss:
-        chunks = [data_mv]
-    else:
-        chunks = [data_mv[i:i + mss] for i in range(0, len(data_mv), mss)]
-            
+    
+    #Legacy version used chunk, changed to active rwnd
+    
+    key = (dest_ip, dst_port)
+    offset = 0
     offset_res = (5 << 4) + 0
     urg_ptr = 0
     
-    for chunk in chunks:
-        chunk_bytes = chunk.tobytes()
+                
+    def make_segment(seq_no, data):
+        draft = pack_tcp_header(src_port, dst_port, seq_no, ack_seq, offset_res, flags, rcv_wnd, 0, urg_ptr)
+        csum = compute_tcp_checksum(src_ip, dest_ip, draft, data)
+        hdr = pack_tcp_header(src_port, dst_port, seq_no, ack_seq, offset_res, flags, rcv_wnd, csum, urg_ptr)
+        return build_ip_header(src_ip, dest_ip, socket.IPPROTO_TCP, len(hdr) + len(data)) + hdr + data
+
+    while offset < len(data_mv):                                  
+        can = usable(flow[key]["peer_rwnd"], float("inf"), current_seq, current_seq)
+        if can == 0:
+            st = flow[key]
+            while st["peer_rwnd"] == 0:
+                if probe_gave_up(st["unanswered_probes"]):
+                    raise ConnectionError("[Streap_flctrl] Probe limit exceeded")
+                now = time.time()
+                if not should_probe(st["peer_rwnd"], 0, st["last_probe"], now):
+                    time.sleep(st["last_probe"] + PROBE_INTERVAL - now)
+                    continue
+                sock.sendto(make_segment(current_seq, data_mv[offset:offset + 1].tobytes()), (dest_ip, 0))
+                st["last_probe"] = now
+                st["unanswered_probes"]+=1
+                print(f"[Streap_flctrl] zero window, probe {st['unanswered_probes']} at seq={current_seq}")       
+                
+                try:
+                    packet, _ = pkt_queue.get(timeout=PROBE_INTERVAL)
+                except queue.Empty:
+                    continue
+                tcp = unpack_tcp_header(packet[(packet[0] & 0x0F) * 4:])
+                st["peer_rwnd"] = tcp['window']
+                st["unanswered_probes"] = 0
+                if tcp['ack_seq'] > current_seq:
+                    offset += 1
+                    total_sent += 1
+                    current_seq += 1
+                continue  
+            continue
+                
+        size = min(mss, can, len(data_mv) - offset)
+        chunk_bytes = data_mv[offset:offset + size].tobytes()
+
+        offset += size
         
-        # 1. Build draft TCP header with checksum = 0
-        draft_tcp_header = pack_tcp_header(
-            src_port, dst_port, current_seq, ack_seq,
-            offset_res, flags, window, 0, urg_ptr
-        )
-        
-        # 2. Compute RFC 1071 Checksum with Pseudo-IP Header
-        tcp_checksum = compute_tcp_checksum(src_ip, dest_ip, draft_tcp_header, chunk_bytes)
-        
-        # 3. Build final TCP header with valid checksum
-        tcp_header = pack_tcp_header(
-            src_port, dst_port, current_seq, ack_seq,
-            offset_res, flags, window, tcp_checksum, urg_ptr
-        )
-        
-        ip_header = build_ip_header(src_ip, dest_ip, socket.IPPROTO_TCP, len(tcp_header) + len(chunk_bytes))
-        full_packet = ip_header + tcp_header + chunk_bytes
+        full_packet = make_segment(current_seq, chunk_bytes)
 
         # 6. Transmit over UDP
         timeout = 1.0  # Timeout in seconds
@@ -86,6 +115,10 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
                 ihl = (packet[0] & 0x0F) * 4
                 tcp = unpack_tcp_header(packet[ihl:])
                 
+                st = flow[key]
+                st["peer_rwnd"] = tcp['window']
+                st["unanswered_probes"] = 0
+                            
                 if tcp['flags'] & 0x10:
                     if tcp['ack_seq'] >= expected_ack:
                         acked = True
@@ -109,7 +142,8 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
         total_sent += len(chunk_bytes)
         current_seq += len(chunk_bytes)
         
-    print(f"[Streap_RDT] Sent {len(chunks)} chunk(s), total {total_sent} bytes, next_seq={current_seq}")
+    # print(f"[Streap_RDT] Sent {len(chunks)} chunk(s), total {total_sent} bytes, next_seq={current_seq}")
+    print(f"[Streap_RDT] Sent {total_sent} bytes, next_seq={current_seq}")
     return total_sent, current_seq
             
 
@@ -146,9 +180,19 @@ def reliable_receive(s: socket.socket, conn_info: conn_struct) -> bytes:
     try:
         while True:
             # Get packet from the dispatcher queue instead of reading directly from socket
+            
+            st = flow.get(client_key)
+            if st is None:
+                return b""
+            
             try:
-                packet, addr = packet_queue.get(timeout=1.0)
+                if (st["rcv_buffer"]):
+                    packet, addr = packet_queue.get_nowait()
+                else:
+                    packet, addr = packet_queue.get(timeout=1.0)
             except queue.Empty:
+                if (st["rcv_buffer"]):
+                    return None
                 continue
             
             
@@ -189,22 +233,6 @@ def reliable_receive(s: socket.socket, conn_info: conn_struct) -> bytes:
                     continue
                 session = connections[client_key]
 
-            # Handle FIN (connection close)
-            if fin_flag:
-                print(f"[Streap_raw] Received FIN from {client_ip}:{client_port}")
-                # Send ACK for FIN
-                header=build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP, 20)
-                ack_packet = build_tcp_packet(listen_ip, client_ip, listen_port, client_port,
-                                              seq=session.server_seq, ack_seq=pkt_seq + 1, ack=1)
-                s.sendto(header + ack_packet, (client_ip, 0))
-
-                with connections_lock:
-                    if client_key in connections:
-                        del connections[client_key]
-                # Clean up packet queue
-                remove_packet_queue(client_key)
-                reorder_buffers.pop(client_key, None)
-                return b""
 
             # Handle RST (connection reset)
             if rst_flag:
@@ -213,8 +241,9 @@ def reliable_receive(s: socket.socket, conn_info: conn_struct) -> bytes:
                     if client_key in connections:
                         del connections[client_key]
                 # Clean up packet queue
-                remove_packet_queue(client_key)
-                reorder_buffers.pop(client_key, None)
+                from .streaprous_raw_connection import forget_connection
+                forget_connection(client_key)
+                
                 return b""
 
             # Update last activity
@@ -226,7 +255,7 @@ def reliable_receive(s: socket.socket, conn_info: conn_struct) -> bytes:
             # Some clients may not set PSH flag for small requests
             has_data = len(tcp_packet) > ((tcp_packet[12] >> 4) & 0x0F) * 4
             
-            if (psh_flag and ack_flag) or (ack_flag and has_data and not syn_flag and not fin_flag and not rst_flag):
+            if (psh_flag and ack_flag) or (ack_flag and has_data and not syn_flag and not rst_flag):
                 # Dynamically look up header length to bypass any incoming TCP Options
                 tcp_header_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
                 app_payload = tcp_packet[tcp_header_len:]
@@ -235,15 +264,18 @@ def reliable_receive(s: socket.socket, conn_info: conn_struct) -> bytes:
                     expected = session.client_seq
                     buf = reorder_buffers.setdefault(client_key, {})
                     data = b""
+                    #Pure function used to delegate responsibility for Flow Control, additional strategies to prevent stale data was also included
+                    type = classify(pkt_seq, len(app_payload), expected, rwnd(RCV_BUF, expected, st["next_to_read"]))
 
-                    if pkt_seq == expected:                 # in order -> deliver + pull from buffer
+                    if type == "in_order":                 # in order -> deliver + pull from buffer
                         data = app_payload
                         expected += len(app_payload)
                         while expected in buf:
                             nxt = buf.pop(expected)
                             data += nxt
                             expected += len(nxt)
-                    elif pkt_seq > expected:                # gap -> hold it
+                        st["rcv_buffer"] += data
+                    elif type == "hold":                # gap -> hold it
                         buf[pkt_seq] = app_payload
                         print(f"[Streap_RDT] Out of order seq={pkt_seq}, want {expected}, buffered")
                     else:                                   # old duplicate -> drop
@@ -252,7 +284,7 @@ def reliable_receive(s: socket.socket, conn_info: conn_struct) -> bytes:
                     # Always ACK the next byte we want (cumulative ACK)
                     header=build_ip_header(session.server_ip, client_ip, socket.IPPROTO_TCP, 20)
                     ack_packet = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port,
-                                                  seq=session.server_seq, ack_seq=expected, ack=1)
+                                                  seq=session.server_seq, ack_seq=expected, ack=1, rcv_wnd=current_rwnd(client_key, expected))
                     s.sendto(header + ack_packet, (client_ip, 0))
 
                     with connections_lock:
@@ -260,12 +292,30 @@ def reliable_receive(s: socket.socket, conn_info: conn_struct) -> bytes:
                             connections[client_key] = session._replace(
                                 client_seq=expected, last_activity=time.time())
 
-                    if data:
-                        return data
+                    # if data:
+                    #     return data
                     # nothing deliverable yet -> fall through and keep looping
 
-
+            # Handle FIN (connection close)
+            # Ensure that the FIN check only works after data is handled, preventing data lost
+            if fin_flag:             
+                
+                # return leftover
+                plen = len(tcp_packet) - ((tcp_packet[12] >> 4) & 0x0F) * 4
+                with connections_lock:
+                    session = connections.get(client_key)  
+                if session and pkt_seq + plen == session.client_seq: 
+                    fin_ack = session.client_seq + 1
+                    with connections_lock:
+                        connections[client_key] = session._replace(state="CLOSE_WAIT", client_seq=fin_ack)
+                    header = build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP, 20)
+                    ack_packet = build_tcp_packet(listen_ip, client_ip, listen_port, client_port,
+                                                seq=session.server_seq, ack_seq=fin_ack, ack=1)
+                    s.sendto(header + ack_packet, (client_ip, 0))
+                    return None if st["rcv_buffer"] else b""
+            
             # Handle pure ACK (no data)
+            #FIN was previously handled here, which is before data processing and might result in data loss, so it's handled below
             elif ack_flag and not syn_flag and not psh_flag and not has_data:
                 print(f"[Streap_raw] Received ACK from {client_ip}:{client_port} (Ack={pkt_ack})")
                 with connections_lock:
@@ -274,6 +324,13 @@ def reliable_receive(s: socket.socket, conn_info: conn_struct) -> bytes:
                             server_seq=pkt_ack,
                             last_activity=time.time()
                         )
+                #Probe ACK
+                if (pkt_seq < session.client_seq):
+                    header = build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP, 20)
+                    ack_packet = build_tcp_packet(listen_ip, client_ip, listen_port, client_port,
+                                                seq=session.server_seq, ack_seq=session.client_seq, ack=1, rcv_wnd=current_rwnd(client_key, session.client_seq))
+                    s.sendto(header + ack_packet, (client_ip, 0))
+                
 
     except KeyboardInterrupt:
         print("\n[Streap_raw] Receive loop interrupted.")

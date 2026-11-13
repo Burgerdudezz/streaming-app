@@ -27,8 +27,10 @@ FIN = 0x01
 DATA = 0x08
 SYN_ACK = SYN | ACK
 
+from .streaprous_flow_control import RCV_BUF
 
-def pack_tcp_header(src_port, dst_port, seq, ack_seq, offset_res, flags, window, checksum, urg_ptr):
+
+def pack_tcp_header(src_port, dst_port, seq, ack_seq, offset_res, flags, window=RCV_BUF, checksum=0, urg_ptr=0):
     """
     Stitches a structurally flawless 20-byte TCP header using Network Byte Order (!).
     
@@ -299,7 +301,7 @@ def rdt_send(sock, arg1, arg2, arg3=None, arg4=None, *args, **kwargs):
         
     New Raw Socket API (for TCP-style):
         rdt_send(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, data, 
-                 auto_chunk=True, mss=1460, flags=0x18, window=5840, reliable=False)
+                 auto_chunk=True, mss=1460, flags=0x18, reliable=False)
     """
     # Check if this is the new raw socket API:
     # arg1 is src_ip (str), arg2 is dest_ip (str), arg3 is src_port (int), etc.
@@ -349,7 +351,7 @@ def rdt_send(sock, arg1, arg2, arg3=None, arg4=None, *args, **kwargs):
     return len(data), seq_num + payload_len
 
 
-def _rdt_send_raw_legacy(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, data, auto_chunk=True, mss=1460, flags=0x18, window=5840):
+def _rdt_send_raw_legacy(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, data, auto_chunk=True, mss=1460, flags=0x18, window=RCV_BUF):
     """
     Legacy TCP-style RDT send for raw sockets with IP+TCP headers (without ACK waiting).
     Used for testing and backward compatibility.
@@ -366,7 +368,7 @@ def _rdt_send_raw_legacy(sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq
         auto_chunk(bool): If True, automatically fragment data into mss-sized chunks
         mss       (int): Maximum Segment Size (default: 1460 bytes)
         flags     (int): TCP flags (default: 0x18 -> PSH + ACK)
-        window    (int): TCP window size (default: 5840)
+        window    (int): TCP window size
         
     Returns:
         tuple: (total_sent, next_seq)
