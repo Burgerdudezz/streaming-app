@@ -124,8 +124,7 @@ class Request():
         
         self._raw_headers, self._raw_body = self.fetch_headers_body(request)
         self.headers = self.prepare_headers(self._raw_headers)
-        
-        # self.prepare_headers(self._raw_headers)
+
         print("[Request] Parsed headers: {}".format(self.headers))
 
         #

@@ -199,7 +199,6 @@ class HttpAdapter:
         
         # Close connection with FIN packet
         #
-        # TODO run_conn_send packet
         # close_connection(...)
         close_connection(raw_socket, conn_info)
 

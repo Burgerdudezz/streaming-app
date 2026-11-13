@@ -31,7 +31,7 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
             auto_chunk(bool): If True, automatically fragment data into mss-sized chunks
             mss       (int): Maximum Segment Size (default: 1460 bytes)
             flags     (int): TCP flags (default: 0x18 -> PSH + ACK)
-            window    (int): TCP window size
+            rcv_wnd    (int): TCP window size
             
         Returns:
             tuple: (total_sent, next_seq)"""
@@ -142,7 +142,6 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
         total_sent += len(chunk_bytes)
         current_seq += len(chunk_bytes)
         
-    # print(f"[Streap_RDT] Sent {len(chunks)} chunk(s), total {total_sent} bytes, next_seq={current_seq}")
     print(f"[Streap_RDT] Sent {total_sent} bytes, next_seq={current_seq}")
     return total_sent, current_seq
             
@@ -264,7 +263,8 @@ def reliable_receive(s: socket.socket, conn_info: conn_struct) -> bytes:
                     expected = session.client_seq
                     buf = reorder_buffers.setdefault(client_key, {})
                     data = b""
-                    #Pure function used to delegate responsibility for Flow Control, additional strategies to prevent stale data was also included
+                    #Pure function used to delegate responsibility for Flow Control
+                    # Drop duplicates and segments beyond the receive window.
                     type = classify(pkt_seq, len(app_payload), expected, rwnd(RCV_BUF, expected, st["next_to_read"]))
 
                     if type == "in_order":                 # in order -> deliver + pull from buffer
@@ -292,15 +292,11 @@ def reliable_receive(s: socket.socket, conn_info: conn_struct) -> bytes:
                             connections[client_key] = session._replace(
                                 client_seq=expected, last_activity=time.time())
 
-                    # if data:
-                    #     return data
-                    # nothing deliverable yet -> fall through and keep looping
 
             # Handle FIN (connection close)
             # Ensure that the FIN check only works after data is handled, preventing data lost
             if fin_flag:             
                 
-                # return leftover
                 plen = len(tcp_packet) - ((tcp_packet[12] >> 4) & 0x0F) * 4
                 with connections_lock:
                     session = connections.get(client_key)  
@@ -315,7 +311,7 @@ def reliable_receive(s: socket.socket, conn_info: conn_struct) -> bytes:
                     return None if st["rcv_buffer"] else b""
             
             # Handle pure ACK (no data)
-            #FIN was previously handled here, which is before data processing and might result in data loss, so it's handled below
+            #FIN was previously handled here, which is before data processing and might result in data loss, so it's handled above
             elif ack_flag and not syn_flag and not psh_flag and not has_data:
                 print(f"[Streap_raw] Received ACK from {client_ip}:{client_port} (Ack={pkt_ack})")
                 with connections_lock:

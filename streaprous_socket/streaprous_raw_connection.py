@@ -730,7 +730,7 @@ def close_connection(s: socket.socket, conn_info: conn_struct):
     peer_fin  = session.state == "CLOSE_WAIT"
     deadline  = time.time() + 3
     
-    #Trying to make sure that the sender got the FIN 
+    #Trying to make sure that the peer  got the FIN 
     while not (fin_acked and peer_fin) and time.time() < deadline:
         try: 
             q = get_packet_queue(client_key)
