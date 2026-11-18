@@ -7,18 +7,15 @@
 #
 # StreapRous release
 #
-# The authors hereby grant to Licensee personal permission to use
-# and modify the Licensed Source Code for the sole purpose of studying
-# while attending the course
-#
 
 """
 StreapRous Raw Connection Library
 A library for handling TCP connections with raw sockets.
-Based on raw_connection_server.py implementation.
-Provides connection management, send/receive functionality using raw sockets.
+Provides connection management, reliable send/receive, flow control,
+and congestion control using raw sockets.
 """
 
+import secrets
 import socket
 import struct
 import sys
@@ -28,18 +25,27 @@ import queue
 from collections import namedtuple
 import netifaces
 
-# Import streaprout packet dispatcher functions
+from .transport_control import (
+    CubicController,
+    FlowControlWindow,
+    ReceiveReorderBuffer,
+    ReliableSendBuffer,
+    RttEstimator,
+    seq_add,
+    seq_le,
+)
+
 from .streaprous_packet_dispatcher import (
     start_packet_dispatcher,
-    stop_packet_dispatcher,
     get_packet_queue,
     remove_packet_queue,
-    _packet_dispatcher_lock,
     _SYN_KEY,
 )
 
-# Connection structure 
-# This structure holds connection and its state information
+TCP_MSS = 1400
+RECEIVE_CAPACITY = 64 * 1024
+
+# Connection structure
 conn_struct = namedtuple('conn_struct', [
     'client_ip',
     'client_port',
@@ -50,87 +56,139 @@ conn_struct = namedtuple('conn_struct', [
     'client_seq',
     'expected_final_ack',
     'last_activity'
-    
 ])
+ConnectionInfo = conn_struct
 
-
-
-# Global table to manage multiple connection
-# The mapping include {key: value} as { (client_ip, client_port): conn_struct }
+# Global table to manage multiple connections: { (client_ip, client_port): conn_struct }
 connections = {}
 connections_lock = threading.Lock()
 
+# Per-connection TCP control blocks (ReliableSendBuffer, ReceiveReorderBuffer, Flow, Congestion, RTT)
+_conn_states = {}
+
 # Management structure to serialize the 3-way handshake
-# Each hand shake is manage by a unique ID client_key
-# including client_ip client_port
 handshake_lock = threading.Lock()
 handshake_in_progress = {}
-
+_cleanup_thread = None
+_cleanup_lock = threading.Lock()
 
 # Default raw port listener
 DEFAULT_LISTEN_IP = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 22239
-DEFAULT_INTERFACE_NAME = "lo0"
+DEFAULT_INTERFACE_NAME = "eth0"
+
+
+def _generate_isn() -> int:
+    """Generate a random 32-bit Initial Sequence Number (RFC 9293)."""
+    return secrets.randbelow(0xFFFFFFFE) + 1
+
+
+def _touch_connection(client_key):
+    """Refresh last_activity timestamp so active transfers are never timed out."""
+    with connections_lock:
+        session = connections.get(client_key)
+        if session is not None:
+            connections[client_key] = session._replace(last_activity=time.time())
+
+
+def _advertised_window(st) -> int:
+    """Receive window after accounting for both reorder storage and app-unread bytes."""
+    receiver = st["receiver"]
+    occupied = receiver.buffered_bytes + len(st["unread"])
+    return max(0, receiver.capacity - occupied)
+
+
+def _receive_payload(st, seq: int, payload: bytes) -> bytes:
+    """Receive in-order stream bytes without exceeding the total per-connection capacity.
+
+    ReceiveReorderBuffer drains contiguous bytes from its own ready area on each
+    receive(), so those bytes are transferred to the application-facing unread
+    buffer and must continue consuming receive-window capacity until the app reads.
+    Caller must hold st["lock"].
+    """
+    if not payload:
+        return b""
+    receiver = st["receiver"]
+    original_capacity = receiver.capacity
+    receiver.capacity = max(0, original_capacity - len(st["unread"]))
+    try:
+        ready = receiver.receive(seq, payload)
+    finally:
+        receiver.capacity = original_capacity
+    if ready:
+        st["unread"].extend(ready)
+    return ready
+
+
+def _take_unread(st) -> bytes:
+    """Drain bytes already accepted from the peer for the application."""
+    with st["lock"]:
+        ready = bytes(st["unread"])
+        st["unread"].clear()
+        # Also drain any bytes that remain in the reorder buffer's ready area.
+        pending_ready = st["receiver"].read()
+        if pending_ready:
+            ready += pending_ready
+    return ready
+
+
+def _valid_final_ack(client_seq: int, client_syn_seq: int,
+                     ack_num: int, expected_ack: int) -> bool:
+    """Validate both sequence and acknowledgement numbers of the 3rd handshake leg."""
+    return client_seq == seq_add(client_syn_seq, 1) and ack_num == expected_ack
+
+
+def _ensure_cleanup_thread():
+    """Start exactly one daemon cleanup loop for stale connection state."""
+    global _cleanup_thread
+    with _cleanup_lock:
+        if _cleanup_thread is None or not _cleanup_thread.is_alive():
+            _cleanup_thread = threading.Thread(
+                target=clean_expired_connections,
+                daemon=True,
+                name="streaprous-connection-cleanup",
+            )
+            _cleanup_thread.start()
+
+
+def _remove_connection(client_key):
+    """Clean up connection metadata, transport state, and dispatcher queue."""
+    with connections_lock:
+        connections.pop(client_key, None)
+        _conn_states.pop(client_key, None)
+    remove_packet_queue(client_key)
+
 
 def register_keep_port_alive(listen_ip="0.0.0.0", listen_port=22239, retry_interval=10):
-    """
-    Periodically register and maintain TCP port.
-    Retry registration whenever binding/listening fails.
-    Never accept incoming connections.
-    
-    Args:
-        listen_ip: IP address to bind to (default: "0.0.0.0")
-        listen_port: Port to bind to (default: 22239)
-        retry_interval: Seconds to wait before retrying after failure (default: 10)
-    
-    Returns:
-        threading.Thread: The background thread running the port keep-alive
-    """
+    """Periodically register and maintain TCP port without accepting on standard socket."""
     def _keep_alive():
-        print(f"[Streap_raw]  Start port keep-alive thread for {listen_ip}:{listen_port}")
+        print(f"[Streap_raw] Start port keep-alive thread for {listen_ip}:{listen_port}")
         attempt = 0
         while True:
             attempt += 1
             standard_sock = None
-
             try:
-                print(f"[Streap_raw] register_keep_port_alive: Attempt #{attempt} - Create socket...")
                 standard_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 standard_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-                print(f"[Streap_raw] register_keep_port_alive: Bind to {listen_ip}:{listen_port}...")
                 standard_sock.bind((listen_ip, listen_port))
-                
-                print(f"[Streap_raw] register_keep_port_alive: Listen on port {listen_port}...")
-                standard_sock.listen(0)  # No backlog, we won't accept connections
+                standard_sock.listen(0)
                 print(f"[Streap_raw] register_keep_port_alive: Done port {listen_port} registration.")
-
-                # Keep socket alive until an error occurs.
                 while True:
                     time.sleep(3600)
             except Exception as e:
                 print(f"[Streap_raw] register_keep_port_alive: Fail port registration with error {e}")
             finally:
                 if standard_sock:
-                    print(f"[Streap_raw] register_keep_port_alive: Close socket...")
                     standard_sock.close()
-
-            print(f"[Streap_raw] register_keep_port_alive: Retry port registration in {retry_interval}s... (attempt #{attempt + 1})")
             time.sleep(retry_interval)
-    
-    print(f"[Streap_raw] register_keep_port_alive: Starting background thread for port {listen_port}")
+
     thread = threading.Thread(target=_keep_alive, daemon=True, name=f"port-keep-alive-{listen_port}")
     thread.start()
-    print(f"[Streap_raw] register_keep_port_alive: Thread started (name={thread.name})")
     return thread
 
 
 def checksum(msg):
-    """Calculates a checksum and returns computed values.
-
-    Args:
-         msg message data
-    """
+    """Calculates an RFC 1071 Internet checksum and returns an integer."""
     if len(msg) % 2 == 1:
         msg += b'\x00'
     s = 0
@@ -141,186 +199,119 @@ def checksum(msg):
     s += (s >> 16)
     return ~s & 0xffff
 
-from .streaprous_flow_control import RCV_BUF, flow, current_rwnd, need_window_update
 
-def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, ack=0, fin=0, rcv_wnd=RCV_BUF):
-    """Stitches a structurally flawless 20-byte TCP header.
-
-    Args:
-         src_ip    Source IP address
-         dest_ip   Destination IP address
-         src_port  Source port
-         dst_port  Destination port
-         seq       Sequence number
-         ack_seq   ACK for sequence
-         syn=0     SYN flag
-         ack=0     ACK flag
-         fin=0     FIN flag
-    """
+def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, ack=0, fin=0, window=5840):
+    """Stitches a structurally flawless 20-byte TCP header."""
     flags = (ack << 4) + (syn << 1) + fin
-    offset_res = (5 << 4) + 0  # 20 bytes data offset (5 * 4)
-    window = rcv_wnd
+    offset_res = (5 << 4) + 0
+    window = max(0, min(65535, int(window)))
     urg_ptr = 0
     draft_checksum = 0
 
-    # Build a draft (20 byte) header with no checksum
     tcp_header_temp = struct.pack('!HHLLBBHHH',
         src_port, dst_port, seq, ack_seq,
         offset_res, flags, window, draft_checksum, urg_ptr
     )
-    
-    # Build addressing-header
     address_header = struct.pack('!4s4sBBH',
         socket.inet_aton(src_ip), socket.inet_aton(dest_ip),
         0, socket.IPPROTO_TCP, len(tcp_header_temp)
     )
-    
-    # Calculate mathematical checksum integer
-    tcp_checksum = checksum(address_header+ tcp_header_temp)
-    
-    # Build the final TCP packet
-    tcp_header = struct.pack('!HHLLBBHHH',
+    tcp_checksum = checksum(address_header + tcp_header_temp)
+    return struct.pack('!HHLLBBHHH',
         src_port, dst_port, seq, ack_seq,
         offset_res, flags, window, tcp_checksum, urg_ptr
     )
-    
-    return tcp_header
 
 
 def build_ip_header(src_ip, dest_ip, protocol, payload_len):
-    """Builds a structurally flawless 20-byte IP header.
-
-    Args:
-         src_ip       Source IP address
-         dest_ip      Destination IP address
-         protocol     Protocol number
-         payload_len  Payload length
-    """
-    version_ihl = (4 << 4) | 5  # Version 4, IHL 5 (20 bytes)
+    """Builds a structurally flawless 20-byte IP header."""
+    version_ihl = (4 << 4) | 5
     tos = 0
-    total_len = 20 + payload_len  # IP header + payload
-
-    # TODO: We draft with no-fragment package
-    #       Full implementation must include fragment
-    #       handling function
+    total_len = 20 + payload_len
     identification = 0x1234
-    flags_fragment = 0x4000
-    flags_offset = 0 
+    flags_offset = 0
     ttl = 64
     draft_checksum = 0
-    
-    # Build draft header with no checksum
+
     ip_header_temp = struct.pack('!BBHHHBBH4s4s',
         version_ihl, tos, total_len, identification,
         flags_offset, ttl, protocol, draft_checksum,
         socket.inet_aton(src_ip), socket.inet_aton(dest_ip)
     )
-    
-    # Calculate the checksum
     ip_checksum = checksum(ip_header_temp)
-    
-    # Build the final IP header
-    ip_header = struct.pack('!BBHHHBBH4s4s',
+    return struct.pack('!BBHHHBBH4s4s',
         version_ihl, tos, total_len, identification,
         flags_offset, ttl, protocol, ip_checksum,
         socket.inet_aton(src_ip), socket.inet_aton(dest_ip)
     )
-    
-    return ip_header
 
 
-def send_tcp_data_segment(s, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, payload, rwnd=RCV_BUF):
-    """Assembles and transmits a single TCP segment containing data payload.
-
-    Args:
-         src_ip       Source IP address
-         dest_ip      Destination IP address
-         src_port     Source port
-         dst_port     Destination port
-         seq          Sequence number
-         ack_seq      ACK for sequence
-         syn          SYN flag
-         ack          ACK flag
-         payload      Payload
-
-    """
-
-    # TODO: Hardcode for fast data pushing
-    #       The setting PSH + ACK
-    #       need to modify in full schema
-    flags = 0x18
+def send_tcp_data_segment(s, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, payload, window=5840):
+    """Assembles and transmits a single TCP segment containing data payload."""
+    flags = 0x18  # PSH + ACK
     offset_res = (5 << 4) + 0
-    window = rwnd
+    window = max(0, min(65535, int(window)))
     urg_ptr = 0
     draft_checksum = 0
-    
-    # Build draft header with no checksum
+
     tcp_header_temp = struct.pack('!HHLLBBHHH',
         src_port, dst_port, seq, ack_seq,
         offset_res, flags, window, draft_checksum, urg_ptr
     )
-    
     tcp_len = len(tcp_header_temp) + len(payload)
     pseudo = struct.pack('!4s4sBBH',
         socket.inet_aton(src_ip), socket.inet_aton(dest_ip),
         0, socket.IPPROTO_TCP, tcp_len
     )
-
-    # Calculate the checksum    
     tcp_checksum = checksum(pseudo + tcp_header_temp + payload)
-
-    # Build the full TCP packet header    
     tcp_header = struct.pack('!HHLLBBHHH',
         src_port, dst_port, seq, ack_seq,
         offset_res, flags, window, tcp_checksum, urg_ptr
     )
-
-    # Build the full IP packet header     
     ip_header = build_ip_header(src_ip, dest_ip, socket.IPPROTO_TCP, len(tcp_header) + len(payload))
-
-    # Build the full packet header     
     full_packet = ip_header + tcp_header + payload
-
-    # Send packet
-    print(f"[Streap_raw] send_tcp_data_segment: seq={seq}, ack_seq={ack_seq}, payload_len={len(payload)}, flags=0x{flags:02x}")
-    print(f"[Streap_raw] send_tcp_data_segment: TCP header seq={seq}, ack_seq={ack_seq}, flags=0x{flags:02x}")
     s.sendto(full_packet, (dest_ip, 0))
-    
     return len(payload)
 
 
-def clean_expired_connections(timeout=60):
-    """Background thread to clean up stale or timed-out connections.
+def _decode_packet(packet: bytes):
+    """Extract TCP fields and payload from an IPv4/TCP raw packet."""
+    if len(packet) < 20 or (packet[0] >> 4) != 4:
+        return None
+    ihl = (packet[0] & 0x0F) * 4
+    if len(packet) < ihl + 20 or packet[9] != 6:
+        return None
+    tcp = packet[ihl:]
+    data_offset = (tcp[12] >> 4) * 4
+    if data_offset < 20 or len(tcp) < data_offset:
+        return None
+    src_port, dst_port, seq, ack = struct.unpack('!HHII', tcp[:12])
+    flags = tcp[13]
+    window = struct.unpack('!H', tcp[14:16])[0]
+    return src_port, dst_port, seq, ack, flags, window, tcp[data_offset:]
 
-    Args:
-         timeout Time expiration for clean-up working
-    """
+
+def clean_expired_connections(timeout=60):
+    """Background thread to clean up stale or timed-out connections."""
     while True:
         time.sleep(10)
         now = time.time()
         with connections_lock:
             expired = [k for k, session in connections.items() if now - session.last_activity > timeout]
+            for k in expired:
+                print(f"[Streap_raw] clean_expired_connections: Session [{k[0]}:{k[1]}] timed out ({timeout}s). Removing.")
+                del connections[k]
+                _conn_states.pop(k, None)
         for k in expired:
-            print(f"[Streap_raw] clean_expired_connections: Session [{k[0]}:{k[1]}] Connection timed out ({timeout}s inactivity). Remove connection.")
-            forget_connection(k)
+            remove_packet_queue(k)
 
 
-def create_raw_socket() -> socket.socket:
-    """
-    Create a raw socket for TCP protocol. The raw socket requires root privileges.
-    It is raw with listen all packet for incoming port.
-    
-    Returns:
-        Raw socket object
-    """
+def create_raw_socket(interface_name: str = "lo0") -> socket.socket:
+    """Create a raw socket for TCP protocol. Requires root privileges."""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-
-        # TODO: port listener need to be post-procesed later
-        #       raw_socket ignore the transport protocol deatails
-
-        print(f"[Streap_raw] Create raw socket binding for 0.0.0.0 listening")
+        print("[Streap_raw] Create raw socket binding for 0.0.0.0 listening")
         return sock
     except PermissionError:
         print("Error: Root privileges required (sudo).")
@@ -331,23 +322,13 @@ def create_raw_socket() -> socket.socket:
 
 
 def get_interface_ip(interface_name: str = None) -> str:
-    """
-    Get the IPv4 address of a network interface.
-    
-    Args:
-        interface_name: Network interface name (e.g., 'enp0s8', 'eth0', 'en0')
-                        If None, tries to find the default route interface.
-    
-    Returns:
-        IPv4 address string
-    """
+    """Get the IPv4 address of a network interface."""
     try:
         if interface_name:
             addrs = netifaces.ifaddresses(interface_name)
             if netifaces.AF_INET in addrs:
                 return addrs[netifaces.AF_INET][0]['addr']
         else:
-            # Try to get default route interface
             gateways = netifaces.gateways()
             default_gateway = gateways.get('default', {}).get(netifaces.AF_INET)
             if default_gateway:
@@ -357,8 +338,7 @@ def get_interface_ip(interface_name: str = None) -> str:
                     return addrs[netifaces.AF_INET][0]['addr']
     except Exception:
         pass
-    
-    # Fallback: try to get any non-loopback IP
+
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -369,420 +349,543 @@ def get_interface_ip(interface_name: str = None) -> str:
         return "127.0.0.1"
 
 
+def _init_established_session(s: socket.socket, client_key, send_ip: str, listen_port: int,
+                              pkt_seq: int, pkt_ack: int, win: int,
+                              expected_ack: int, initial_payload: bytes) -> conn_struct:
+    """Create ESTABLISHED conn_struct and TCP control state, handling any piggybacked payload."""
+    client_ip, client_port = client_key
+    receiver = ReceiveReorderBuffer(initial_seq=pkt_seq, capacity=RECEIVE_CAPACITY)
+    sender = ReliableSendBuffer(initial_seq=pkt_ack)
+    flow = FlowControlWindow(rwnd=win)
+    congestion = CubicController(mss=TCP_MSS)
+    rtt = RttEstimator()
+
+    initial_ready = b""
+    if initial_payload:
+        initial_ready = receiver.receive(pkt_seq, initial_payload)
+        ack_pkt = build_tcp_packet(
+            send_ip, client_ip, listen_port, client_port,
+            seq=pkt_ack, ack_seq=receiver.rcv_nxt, ack=1,
+            window=max(0, receiver.capacity - receiver.buffered_bytes - len(initial_ready))
+        )
+        ip_hdr = build_ip_header(send_ip, client_ip, socket.IPPROTO_TCP, len(ack_pkt))
+        s.sendto(ip_hdr + ack_pkt, (client_ip, 0))
+
+    session = conn_struct(
+        client_ip=client_ip,
+        client_port=client_port,
+        server_ip=send_ip,
+        server_port=listen_port,
+        state="ESTABLISHED",
+        server_seq=pkt_ack,
+        client_seq=receiver.rcv_nxt,
+        expected_final_ack=expected_ack,
+        last_activity=time.time()
+    )
+    with connections_lock:
+        connections[client_key] = session
+        _conn_states[client_key] = {
+            "lock": threading.RLock(),
+            "sender": sender,
+            "receiver": receiver,
+            "rtt": rtt,
+            "flow": flow,
+            "congestion": congestion,
+            # Bytes already made contiguous during the handshake remain unread by the app.
+            "unread": bytearray(initial_ready),
+        }
+    return session
+
+
 def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: str = None) -> conn_struct:
-    """
-    Accept a new connection by performing the 3-way handshake using raw sockets.
-    Returns a conn_struct tuple for the established connection.
-    Handshakes are serialized to ensure only one 3-way handshake is processed at a time.
-    
-    Args:
-        s: Raw socket
-        listen_ip: Server IP to listen on (e.g., '0.0.0.0')
-        listen_port: Server port to listen on
-        interface_name: Network interface name for sending packets (optional)
-    
-    Returns:
-        conn_struct: Established connection information
-    """
-    # Start packet dispatcher for this port
+    """Accept a new connection by performing the 3-way handshake using raw sockets."""
     start_packet_dispatcher(s, listen_port)
-    
-    # Get actual source IP for sending packets
+    _ensure_cleanup_thread()
+
     if listen_ip == "0.0.0.0":
         send_ip = get_interface_ip(interface_name)
         print(f"[Streap_raw] accept: listen_ip=0.0.0.0, using send_ip={send_ip} for outgoing packets")
     else:
         send_ip = listen_ip
-    
-    server_seq = 2000
-    client_ip = None
-    client_port = None
 
     print(f"[Streap_raw] accept: Waiting for incoming connections on {listen_ip}:{listen_port} (send_ip={send_ip})...")
     try:
         while True:
-            # Get packet from dispatcher queue (for SYN packets)
             syn_q = get_packet_queue(_SYN_KEY)
             try:
-                packet, addr = syn_q.get(timeout=1.0)
-                print(f"[Streap_raw] accept: Got packet from SYN queue")
+                packet, _addr = syn_q.get(timeout=1.0)
             except queue.Empty:
                 continue
 
-            # Extract IP Header Length
-            ihl = (packet[0] & 0x0F) * 4
-            tcp_packet = packet[ihl:]
-            
-            if len(tcp_packet) < 20:
+            decoded = _decode_packet(packet)
+            if decoded is None:
                 continue
-
-            # Unpack the received TCP header
-            tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
-            src_port, dest_port, pkt_seq, pkt_ack, flags = (
-                tcph[0],
-                tcph[1],
-                tcph[2],
-                tcph[3],
-                tcph[5],
-            )
-
-            # Bypass non-listen port
+            src_port, dest_port, pkt_seq, pkt_ack, flags, win, initial_payload = decoded
             if dest_port != listen_port:
                 continue
 
             syn_flag = (flags & 0x02) >> 1
             ack_flag = (flags & 0x10) >> 4
-
-            # Build client_key from client IP and client port
             client_ip = socket.inet_ntoa(packet[12:16])
             client_port = src_port
             client_key = (client_ip, client_port)
-            print(f"\n[Streap_raw] accept: Receive packet from Client ({client_ip}:{client_port}) (Seq={pkt_seq}, SYN={syn_flag}, ACK={ack_flag})")
 
-            # Create queue for each connection associated 
-            # with tupple client_key=(client_ip, client_port)
-            q = get_packet_queue(client_key)
-            print(f"[Streap_raw] accept: Created per-connection queue for {client_key}")
-            with connections_lock:
-                # Declare initialized session if not available
-                if client_key not in connections:
-                    connections[client_key] = conn_struct(
-                        client_ip=client_ip,
-                        client_port=client_port,
-                        server_ip=send_ip,
-                        server_port=listen_port,
-                        state="LISTEN",
-                        server_seq=2000,
-                        client_seq=0,
-                        expected_final_ack=0,
-                        last_activity=time.time(),                      
-                    )
-                session = connections[client_key]
-
-                        
-            # Perform 3 handshake step
-            # STEP 1: Obtain client SYN 
+            # STEP 1: Obtain client SYN
             if syn_flag == 1 and ack_flag == 0:
-                print(f"\nHandshake1: Received SYN from Client ({client_ip}:{client_port}) (Seq={pkt_seq})")
-
-                # Quick duplicate handshake check (fast, no heavy operations)
                 with handshake_lock:
                     if handshake_in_progress.get(client_key, False):
-                        print(f"[Streap_raw] accept: Handshake already in progress for {client_ip}:{client_port}, dropping SYN")
                         continue
                     handshake_in_progress[client_key] = True
 
-                # STEP 2: Reply SYN-ACK immediately
-                # Build TCP packet for SYN-ACK
-                next_ack = pkt_seq + 1
-                syn_ack_packet = build_tcp_packet(send_ip, client_ip, listen_port, client_port,
-                                                  seq=server_seq, ack_seq=next_ack, syn=1, ack=1)
+                q = get_packet_queue(client_key)
+                server_seq = _generate_isn()
+                next_ack = seq_add(pkt_seq, 1)
+                expected_ack = seq_add(server_seq, 1)
+
+                # STEP 2: Send SYN-ACK
+                syn_ack_packet = build_tcp_packet(
+                    send_ip, client_ip, listen_port, client_port,
+                    seq=server_seq, ack_seq=next_ack, syn=1, ack=1,
+                    window=RECEIVE_CAPACITY
+                )
                 ip_header = build_ip_header(send_ip, client_ip, socket.IPPROTO_TCP, len(syn_ack_packet))
-                full_packet = ip_header + syn_ack_packet
+                s.sendto(ip_header + syn_ack_packet, (client_ip, 0))
 
-                # Send SYN-ACK packet
-                print(f"[Streap_raw] accept: Sending SYN-ACK to {client_ip}:{client_port} from {send_ip}:{listen_port}")
-                print(f"[Streap_raw] accept: SYN-ACK packet size: {len(full_packet)} bytes (IP={len(ip_header)}, TCP={len(syn_ack_packet)})")
-                bytes_sent = s.sendto(full_packet, (client_ip, 0))
-                print(f"Handshake2: Sent SYN-ACK to Client (Seq={server_seq}, Ack={next_ack}, bytes_sent={bytes_sent})")
-
-                # Register connection to the associated queue for each connection associated 
-                # with tupple client_key=(client_ip, client_port)
                 with connections_lock:
                     connections[client_key] = conn_struct(
                         client_ip=client_ip,
                         client_port=client_port,
-                        server_ip=send_ip,  # Use actual sending IP
+                        server_ip=send_ip,
                         server_port=listen_port,
                         state="SYN_RCVD",
                         server_seq=server_seq,
                         client_seq=pkt_seq,
-                        expected_final_ack=server_seq + 1,
+                        expected_final_ack=expected_ack,
                         last_activity=time.time()
                     )
-                    session = connections[client_key]
 
-                # STEP 3: Wait for client FIN-ACK
-                # The final ACK will arrive on the per-connection queue, not the SYN queue
+                # STEP 3: Wait for client's final ACK (and capture any piggybacked payload)
                 deadline = time.time() + 10.0
                 while time.time() < deadline:
                     try:
-                        packet, addr = q.get(timeout=0.5)
-                        print(f"[Streap_raw] accept: Got packet from per-connection queue for {client_ip}:{client_port}")
+                        pkt3, _ = q.get(timeout=0.5)
                     except queue.Empty:
-                        print(f"[Streap_raw] accept: Per-connection queue empty for {client_ip}:{client_port}, waiting...")
                         continue
 
-                    # Extract IP Header Length
-                    ihl = (packet[0] & 0x0F) * 4
-                    tcp_packet = packet[ihl:]
-                    
-                    if len(tcp_packet) < 20:
+                    dec3 = _decode_packet(pkt3)
+                    if dec3 is None:
                         continue
+                    _, _, seq3, ack3, flags3, win3, payload3 = dec3
+                    syn3 = (flags3 & 0x02) >> 1
+                    ack3_flag = (flags3 & 0x10) >> 4
 
-                    # Unpack the received TCP header
-                    tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
-                    src_port, dest_port, pkt_seq, pkt_ack, flags = (
-                        tcph[0],
-                        tcph[1],
-                        tcph[2],
-                        tcph[3],
-                        tcph[5],
-                    )
-
-                    syn_flag = (flags & 0x02) >> 1
-                    ack_flag = (flags & 0x10) >> 4
-                    print(f"[Streap_raw] accept: Received packet in handshake wait - SYN={syn_flag}, ACK={ack_flag}, Seq={pkt_seq}, Ack={pkt_ack}")
-
-                    # Check if this is the final ACK (ACK only, no SYN)
-                    if syn_flag == 0 and ack_flag == 1:
-                        print(f"[Streap_raw] accept: handshake3 Received FIN-ACK from Client (Seq={pkt_seq}, Ack={pkt_ack})")
-
+                    if syn3 == 0 and ack3_flag == 1:
                         with connections_lock:
-                            if session.state != "SYN_RCVD":
-                                print(f"[Streap_raw] accept: Non handshake state for {client_ip}:{client_port}")
+                            cur = connections.get(client_key)
+                            if cur is None or cur.state != "SYN_RCVD":
                                 break
-
-                            # Update connection to ESTABLISHED
-                            connections[client_key] = conn_struct(
-                                client_ip=client_ip,
-                                client_port=client_port,
-                                server_ip=send_ip,
-                                server_port=listen_port,
-                                state="ESTABLISHED",
-                                server_seq=pkt_ack,
-                                client_seq=pkt_seq,
-                                expected_final_ack=session.expected_final_ack,
-                                last_activity=time.time()
-                            )
-                            
-                            flow[client_key] = {
-                                "peer_rwnd": tcph[6],
-                                "rcv_buffer": bytearray(),
-                                "next_to_read": pkt_seq,
-                                "unanswered_probes": 0,
-                                "last_probe": 0.0,
-                            }
-                                                        
-                            session = connections[client_key]
-
-
-                        # Clear handshake in progress flag
+                        if not _valid_final_ack(seq3, cur.client_seq, ack3, expected_ack):
+                            continue
+                        session = _init_established_session(
+                            s, client_key, send_ip, listen_port,
+                            seq3, ack3, win3, expected_ack, payload3
+                        )
                         with handshake_lock:
-                            handshake_in_progress[client_key] = False
-
-                        print(f"[Streap_raw] Established handshake with connection: ({client_ip}:{client_port}) ESTABLISHED")
-                        
-                        # Return the established connection info
+                            handshake_in_progress.pop(client_key, None)
+                        print(f"[Streap_raw] Handshake established with ({client_ip}:{client_port})")
                         return session
-                
-                # Fallback of the handshake timeout
-                print(f"[Streap_raw] Handshake timeout for {client_ip}:{client_port}")
+
                 with handshake_lock:
-                    handshake_in_progress[client_key] = False
-                remove_packet_queue(client_key)
-                forget_connection(client_key)
+                    handshake_in_progress.pop(client_key, None)
+                _remove_connection(client_key)
                 continue
 
-
-            # STEP 3 Exception handling: Capture FIN ACK on SYN queue ---
-            if session.state == "SYN_RCVD" and syn_flag == 0 and ack_flag == 1:
-                print(f"[Streap_raw] accept: handshake3 received Final ACK from Client on SYN queue (Seq={pkt_seq}, Ack={pkt_ack})")
-                print(f"[Streap_raw] accept: Fallback - got final ACK on SYN queue for {client_ip}:{client_port}")
-
-                with connections_lock:
-                    if session.state != "SYN_RCVD":
-                        print(f"[Streap_raw] accept: Non handshake state for {client_ip}:{client_port}")
-                        continue
-
-                    # Update connection to ESTABLISHED
-                    connections[client_key] = conn_struct(
-                        client_ip=client_ip,
-                        client_port=client_port,
-                        server_ip=send_ip,
-                        server_port=listen_port,
-                        state="ESTABLISHED",
-                        server_seq=pkt_ack,
-                        client_seq=pkt_seq,
-                        expected_final_ack=session.expected_final_ack,
-                        last_activity=time.time()
-                    )
-                    session = connections[client_key]
-                    flow[client_key] = {
-                        "peer_rwnd": tcph[6],
-                        "rcv_buffer": bytearray(),
-                        "next_to_read": pkt_seq,
-                        "unanswered_probes": 0,
-                        "last_probe": 0.0,
-                    }
-
-                # Clear handshake in progress flag
+            # STEP 3 Fallback: Final ACK arrived on SYN queue
+            with connections_lock:
+                existing = connections.get(client_key)
+            if (existing is not None and existing.state == "SYN_RCVD"
+                    and syn_flag == 0 and ack_flag == 1
+                    and _valid_final_ack(pkt_seq, existing.client_seq,
+                                         pkt_ack, existing.expected_final_ack)):
+                session = _init_established_session(
+                    s, client_key, send_ip, listen_port,
+                    pkt_seq, pkt_ack, win, existing.expected_final_ack, initial_payload
+                )
                 with handshake_lock:
-                    handshake_in_progress[client_key] = False
-
-                print(f"[Streap_raw] Etablished handshak with connection: ({client_ip}:{client_port}) ESTABLISHED")
-                
-                # Return the established connection info
+                    handshake_in_progress.pop(client_key, None)
+                print(f"[Streap_raw] Handshake established (fallback) with ({client_ip}:{client_port})")
                 return session
 
     except KeyboardInterrupt:
         print("\n[-] Server stopped.")
-        # Clear handshake flags on interrupt
         with handshake_lock:
             handshake_in_progress.clear()
         raise
 
 
-def run_conn_recv(sock: socket.socket, conn_info: conn_struct, max_bytes=4096) -> bytes:
-    """Wrapper utilizing teammate's reliable_receive for raw TCP sockets."""
-    # Imported here, not at the top: streaprous_reliability imports this module,
-    # so a top-level import is circular.
-    
-    
-    from .streaprous_reliability import reliable_receive
-    key = (conn_info.client_ip, conn_info.client_port)                   
-    with connections_lock:
-        session = connections.get(key)
-    if session is None or key not in flow:
-        return b""
-    st = flow[key]
-    
-    """The legacy function hand data directly to the app, the newer approach store them in rcv_buffer for the app to read"""
-    
-    #Handle client's FIN
-    if session.state == "CLOSE_WAIT":
-        data = bytes(st["rcv_buffer"][:max_bytes])
-        del st["rcv_buffer"][:max_bytes]
-        st["next_to_read"] += len(data)
-        return data
-    closed = reliable_receive(sock, conn_info)
-    with connections_lock:  
-        session = connections.get(key)
-    if session is None:
-        return b""
-    old = current_rwnd(key, session.client_seq)
-
-    data = bytes(st["rcv_buffer"][:max_bytes])
-    del st["rcv_buffer"][:max_bytes]
-    st["next_to_read"] += len(data)
-
-    new = current_rwnd(key, session.client_seq)
-    #Send a window update if needed
-    if need_window_update(old, new):
-        header = build_ip_header(session.server_ip, session.client_ip, socket.IPPROTO_TCP, 20)
-        ack = build_tcp_packet(session.server_ip, session.client_ip, session.server_port, session.client_port,
-                               seq=session.server_seq, ack_seq=session.client_seq, ack=1, rcv_wnd=new)
-        sock.sendto(header + ack, (session.client_ip, 0))
-        print(f"[Streap_flctrl] window update {old} -> {new}")
-    return data
-
-def run_conn_send(sock: socket.socket, conn_info: conn_struct, payload: bytes) -> int:
-    """Wrapper utilizing teammate's reliable_send for raw TCP sockets."""
-    key = (conn_info.client_ip, conn_info.client_port)
-    with connections_lock:
-        session = connections.get(key)
-    if session is None:
-        return 0, None
-    from .streaprous_reliability import reliable_send
-    sent, next_seq = reliable_send(
-        sock, conn_info.server_ip, conn_info.client_ip,
-        conn_info.server_port, conn_info.client_port,
-        seq=session.server_seq, ack_seq=session.client_seq,
-        payload=payload,
-        rcv_wnd = current_rwnd(key, session.client_seq)
+def _send_ack_only(s: socket.socket, server_ip: str, client_ip: str,
+                   server_port: int, client_port: int,
+                   seq: int, ack_seq: int, window: int):
+    tcp = build_tcp_packet(
+        server_ip, client_ip, server_port, client_port,
+        seq=seq, ack_seq=ack_seq, ack=1, window=window
     )
-    
-    with connections_lock:
-        if key in connections:
-            connections[key] = connections[key]._replace(server_seq=next_seq)
-    return sent, next_seq
+    ip = build_ip_header(server_ip, client_ip, socket.IPPROTO_TCP, len(tcp))
+    s.sendto(ip + tcp, (client_ip, 0))
 
+
+def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
+    """Receive contiguous ordered bytes on an established connection."""
+    client_key = (conn_info.client_ip, conn_info.client_port)
+    with connections_lock:
+        session = connections.get(client_key)
+        st = _conn_states.get(client_key)
+    if session is None or st is None:
+        return b""
+
+    _touch_connection(client_key)
+
+    # Return bytes buffered during handshake or while run_conn_send() was active.
+    already_ready = _take_unread(st)
+    if already_ready:
+        # Reading from the app buffer frees receive capacity; advertise the update
+        # so a peer previously blocked by a zero/small window can resume sending.
+        with st["lock"]:
+            snd_nxt = st["sender"].snd_nxt
+            rcv_nxt = st["receiver"].rcv_nxt
+            adv_win = _advertised_window(st)
+        _send_ack_only(
+            s, session.server_ip, session.client_ip,
+            session.server_port, session.client_port,
+            seq=snd_nxt, ack_seq=rcv_nxt, window=adv_win
+        )
+        return already_ready
+
+    if session.state in ("CLOSE_WAIT", "CLOSED"):
+        return b""
+
+    q = get_packet_queue(client_key)
+    while True:
+        with connections_lock:
+            session = connections.get(client_key)
+            st = _conn_states.get(client_key)
+        if session is None or st is None or session.state in ("CLOSE_WAIT", "CLOSED"):
+            return b""
+
+        try:
+            packet, _ = q.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        decoded = _decode_packet(packet)
+        if decoded is None:
+            continue
+
+        _touch_connection(client_key)
+        _src, _dst, seq, ack, flags, window, payload = decoded
+        ack_flag = bool(flags & 0x10)
+        syn_flag = bool(flags & 0x02)
+        fin_flag = bool(flags & 0x01)
+        rst_flag = bool(flags & 0x04)
+
+        if rst_flag:
+            _remove_connection(client_key)
+            return b""
+
+        with st["lock"]:
+            st["flow"].update(window)
+            if ack_flag:
+                acked, samples = st["sender"].acknowledge(ack, window=window)
+                if acked > 0:
+                    for sample in samples:
+                        st["rtt"].sample(sample)
+                    st["congestion"].on_ack(acked_bytes=acked)
+
+            ready = b""
+            if payload and not syn_flag:
+                _receive_payload(st, seq, payload)
+                ready = bytes(st["unread"])
+                st["unread"].clear()
+
+            rcv_nxt = st["receiver"].rcv_nxt
+            snd_nxt = st["sender"].snd_nxt
+            adv_win = _advertised_window(st)
+
+            peer_closed = False
+            if fin_flag and seq_add(seq, len(payload)) == rcv_nxt:
+                rcv_nxt = seq_add(rcv_nxt, 1)
+                st["receiver"].rcv_nxt = rcv_nxt
+                peer_closed = True
+
+        with connections_lock:
+            if client_key in connections:
+                new_state = "CLOSE_WAIT" if peer_closed else connections[client_key].state
+                connections[client_key] = connections[client_key]._replace(
+                    state=new_state,
+                    server_seq=snd_nxt,
+                    client_seq=rcv_nxt,
+                    last_activity=time.time()
+                )
+
+        if (payload and not syn_flag) or peer_closed:
+            _send_ack_only(
+                s, session.server_ip, session.client_ip,
+                session.server_port, session.client_port,
+                seq=snd_nxt, ack_seq=rcv_nxt, window=adv_win
+            )
+
+        if ready:
+            return ready
+        if peer_closed:
+            return b""
+
+
+def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> int:
+    """Transmit reliably using rwnd/cwnd, RTT/RTO, retransmission and Fast Retransmit.
+
+    Retries are bounded per segment (eight retransmissions); this is not a
+    strict wall-clock deadline because the RTO backs off exponentially.
+    """
+    if not payload:
+        return 0
+
+    client_key = (conn_info.client_ip, conn_info.client_port)
+    with connections_lock:
+        session = connections.get(client_key)
+        st = _conn_states.get(client_key)
+    if session is None or st is None:
+        print(f"[Streap_raw] run_conn_send: connection not found for {client_key}")
+        return -1
+
+    _touch_connection(client_key)
+    q = get_packet_queue(client_key)
+    data_mv = memoryview(payload)
+    offset = 0
+    total_len = len(data_mv)
+
+    try:
+        while offset < total_len or st["sender"].bytes_in_flight > 0:
+            with connections_lock:
+                session = connections.get(client_key)
+            if session is None:
+                return -1
+
+            # 1. Transmit as many segments as allowed by min(rwnd, cwnd)
+            while offset < total_len:
+                with st["lock"]:
+                    budget = st["flow"].send_budget(
+                        st["sender"].bytes_in_flight,
+                        st["congestion"].cwnd
+                    )
+                    if budget <= 0:
+                        # Zero-Window Probing (RFC 9293): send 1 byte when rwnd == 0
+                        # and nothing is in flight so a lost window-update ACK cannot deadlock.
+                        if st["flow"].rwnd == 0 and st["sender"].bytes_in_flight == 0:
+                            amount = 1
+                        else:
+                            break
+                    else:
+                        amount = min(TCP_MSS, budget, total_len - offset)
+
+                    chunk = bytes(data_mv[offset:offset + amount])
+                    offset += amount
+                    seg = st["sender"].add(chunk)
+                    ack_seq = st["receiver"].rcv_nxt
+                    adv_win = _advertised_window(st)
+
+                send_tcp_data_segment(
+                    s, session.server_ip, session.client_ip,
+                    session.server_port, session.client_port,
+                    seg.seq, ack_seq, seg.data, window=adv_win
+                )
+                _touch_connection(client_key)
+
+            # 2. Wait for ACKs or RTO expiry
+            with st["lock"]:
+                if st["sender"].bytes_in_flight == 0 and offset >= total_len:
+                    break
+                timer_start = st["sender"]._timer_started_at
+                rto = st["rtt"].rto
+            wait_timeout = max(0.01, rto - (time.monotonic() - timer_start)) if timer_start is not None else 0.05
+
+            try:
+                packet, _ = q.get(timeout=wait_timeout)
+            except queue.Empty:
+                # RTO expired -> retransmit oldest unacknowledged segment
+                with st["lock"]:
+                    due = st["sender"].due_for_retransmission(st["rtt"].rto)
+                    if not due:
+                        continue
+                    if any(seg.transmissions > 8 for seg in due):
+                        print(f"[Streap_raw] Max retransmissions exceeded for {client_key}")
+                        return -1
+                    st["rtt"].backoff()
+                    # Do not shrink cwnd when retransmitting a 1-byte Zero-Window Probe
+                    if st["flow"].rwnd > 0:
+                        st["congestion"].on_loss()
+                    retrans_seg = due[0]
+                    ack_seq = st["receiver"].rcv_nxt
+                    adv_win = _advertised_window(st)
+
+                send_tcp_data_segment(
+                    s, session.server_ip, session.client_ip,
+                    session.server_port, session.client_port,
+                    retrans_seg.seq, ack_seq, retrans_seg.data, window=adv_win
+                )
+                _touch_connection(client_key)
+                continue
+
+            decoded = _decode_packet(packet)
+            if decoded is None:
+                continue
+
+            _touch_connection(client_key)
+            _src, _dst, seq, ack, flags, window, in_payload = decoded
+            ack_flag = bool(flags & 0x10)
+            syn_flag = bool(flags & 0x02)
+            fin_flag = bool(flags & 0x01)
+            rst_flag = bool(flags & 0x04)
+
+            if rst_flag:
+                _remove_connection(client_key)
+                return -1
+
+            fast_retrans_seg = None
+            need_ack_reply = False
+
+            with st["lock"]:
+                st["flow"].update(window)
+
+                if ack_flag:
+                    acked, samples = st["sender"].acknowledge(ack, window=window)
+                    if acked > 0:
+                        for sample in samples:
+                            st["rtt"].sample(sample)
+                        st["congestion"].on_ack(acked_bytes=acked)
+                    else:
+                        dup_seg = st["sender"].on_duplicate_ack(
+                            ack, window,
+                            has_payload=bool(in_payload),
+                            syn_or_fin=(syn_flag or fin_flag),
+                        )
+                        if dup_seg is not None:
+                            if st["flow"].rwnd > 0:
+                                st["congestion"].on_loss()
+                            fast_retrans_seg = dup_seg
+
+                # Handle any incoming data or FIN arriving while we are sending
+                if in_payload and not syn_flag:
+                    _receive_payload(st, seq, in_payload)
+                    need_ack_reply = True
+
+                rcv_nxt = st["receiver"].rcv_nxt
+                snd_nxt = st["sender"].snd_nxt
+                adv_win = _advertised_window(st)
+                peer_closed = False
+                if fin_flag and seq_add(seq, len(in_payload)) == rcv_nxt:
+                    rcv_nxt = seq_add(rcv_nxt, 1)
+                    st["receiver"].rcv_nxt = rcv_nxt
+                    peer_closed = True
+                    need_ack_reply = True
+
+            with connections_lock:
+                if client_key in connections:
+                    new_state = "CLOSE_WAIT" if peer_closed else connections[client_key].state
+                    connections[client_key] = connections[client_key]._replace(
+                        state=new_state,
+                        server_seq=snd_nxt,
+                        client_seq=rcv_nxt,
+                        last_activity=time.time()
+                    )
+
+            if fast_retrans_seg is not None:
+                send_tcp_data_segment(
+                    s, session.server_ip, session.client_ip,
+                    session.server_port, session.client_port,
+                    fast_retrans_seg.seq, rcv_nxt, fast_retrans_seg.data, window=adv_win
+                )
+
+            if need_ack_reply:
+                _send_ack_only(
+                    s, session.server_ip, session.client_ip,
+                    session.server_port, session.client_port,
+                    seq=snd_nxt, ack_seq=rcv_nxt, window=adv_win
+                )
+
+        return total_len
+    except Exception as e:
+        print(f"[Streap_raw] run_conn_send error for {client_key}: {e}")
+        return -1
 
 
 def close_connection(s: socket.socket, conn_info: conn_struct):
-    """Close a specific connection by sending FIN and removing from connection table."""
-
-    client_ip = conn_info.client_ip
-    client_port = conn_info.client_port
-    client_key = (client_ip, client_port)
-    listen_ip = conn_info.server_ip
-    listen_port = conn_info.server_port
-        
-    #Connection teardown
-        
-    def send_FIN():
-        
-        fin_packet = build_tcp_packet(listen_ip, client_ip, listen_port, client_port,
-                                          seq=session.server_seq, ack_seq=session.client_seq, ack=1, fin=1)
-        ip_header = build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP, len(fin_packet))
-        s.sendto(ip_header + fin_packet, (client_ip, 0))
-        
+    """Gracefully close a TCP connection using FIN handshake and clean up state."""
+    client_key = (conn_info.client_ip, conn_info.client_port)
     with connections_lock:
-        if client_key in connections:
-            session = connections[client_key]
-            # Send FIN packet
-            send_FIN()
-            print(f"[Streap_raw] run_conn_send: Send FIN to {client_ip}:{client_port}")
-        else:
-            return
+        session = connections.get(client_key)
+        st = _conn_states.get(client_key)
+    if session is None:
+        _remove_connection(client_key)
+        return
 
+    if st is not None:
+        with st["lock"]:
+            fin_seq = st["sender"].snd_nxt
+            ack_seq = st["receiver"].rcv_nxt
+            adv_win = _advertised_window(st)
+    else:
+        fin_seq = session.server_seq
+        ack_seq = session.client_seq
+        adv_win = RECEIVE_CAPACITY
+
+    def _send_fin():
+        fin_pkt = build_tcp_packet(
+            session.server_ip, session.client_ip,
+            session.server_port, session.client_port,
+            seq=fin_seq, ack_seq=ack_seq, ack=1, fin=1, window=adv_win
+        )
+        ip_hdr = build_ip_header(session.server_ip, session.client_ip, socket.IPPROTO_TCP, len(fin_pkt))
+        s.sendto(ip_hdr + fin_pkt, (session.client_ip, 0))
+
+    _send_fin()
+    expected_fin_ack = seq_add(fin_seq, 1)
     fin_acked = False
-    peer_fin  = session.state == "CLOSE_WAIT"
-    deadline  = time.time() + 3
-    
-    #Trying to make sure that the peer  got the FIN 
+    peer_fin = (session.state == "CLOSE_WAIT")
+    q = get_packet_queue(client_key)
+    deadline = time.time() + 2.0
+
     while not (fin_acked and peer_fin) and time.time() < deadline:
-        try: 
-            q = get_packet_queue(client_key)
-            packet, _ = q.get(timeout=0.5)
+        try:
+            packet, _ = q.get(timeout=0.4)
         except queue.Empty:
             if not fin_acked:
-                send_FIN()
-            continue
-            
-        ihl = (packet[0] & 0x0F) * 4
-        tcp_packet = packet[ihl:]
-        
-        if len(tcp_packet) < 20:
+                _send_fin()
             continue
 
-        tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
-        src_port, dest_port, pkt_seq, pkt_ack, flags = (
-            tcph[0],
-            tcph[1],
-            tcph[2],
-            tcph[3],
-            tcph[5],
-        )
-
-        fin_flag = flags & 0x01
-        ack_flag = (flags & 0x10) >> 4
-            
-        if ack_flag and pkt_ack >= session.server_seq + 1:
+        decoded = _decode_packet(packet)
+        if decoded is None:
+            continue
+        _src, _dst, pkt_seq, pkt_ack, flags, _win, payload = decoded
+        if flags & 0x04:  # RST
+            break
+        if (flags & 0x10) and seq_le(expected_fin_ack, pkt_ack):
             fin_acked = True
-        if fin_flag:
+        if flags & 0x01:  # FIN
             peer_fin = True
-            payload_len = len(tcp_packet) - ((tcp_packet[12] >> 4) * 4)
-            ack_packet = build_tcp_packet(listen_ip, client_ip, listen_port, client_port,
-                                          seq=session.server_seq+1, ack_seq=pkt_seq + payload_len + 1, ack=1)
-            ip_header = build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
-            s.sendto(ip_header + ack_packet, (client_ip, 0))
-    
-    # Clean up packet queue
-    forget_connection(client_key)
+            peer_fin_ack_seq = seq_add(seq_add(pkt_seq, len(payload)), 1)
+            _send_ack_only(
+                s, session.server_ip, session.client_ip,
+                session.server_port, session.client_port,
+                seq=expected_fin_ack, ack_seq=peer_fin_ack_seq, window=adv_win
+            )
+
+    _remove_connection(client_key)
+    print(f"[Streap_raw] Closed and cleaned up connection {client_key}")
 
 
 def close_all_connections():
     """Close all connections and clean up."""
     with connections_lock:
-        connections.clear()
-
-def forget_connection(client_key):
-    """Clean up utils"""
-    from .streaprous_reliability import reorder_buffers  
-    from .streaprous_flow_control import flow
-    with connections_lock:
-        connections.pop(client_key, None)
-    remove_packet_queue(client_key)
-    reorder_buffers.pop(client_key, None)
-    flow.pop(client_key, None)
+        keys = list(connections.keys())
+    for k in keys:
+        _remove_connection(k)
