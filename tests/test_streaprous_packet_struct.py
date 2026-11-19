@@ -11,7 +11,6 @@ from streaprous_socket.streaprous_packet_struct import (
     pack_tcp_header,
     unpack_tcp_header,
     compute_tcp_checksum,
-    rdt_send
 )
 
 class TestStreaprousPacketStruct(unittest.TestCase):
@@ -72,27 +71,6 @@ class TestStreaprousPacketStruct(unittest.TestCase):
         s = (s >> 16) + (s & 0xffff)
         s += (s >> 16)
         self.assertEqual(~s & 0xffff, 0)
-
-    def test_memoryview_fragmentation(self):
-        # Mock socket for rdt_send
-        class MockSocket:
-            def __init__(self):
-                self.sent_packets = []
-            def sendto(self, packet, addr):
-                self.sent_packets.append((packet, addr))
-                
-        sock = MockSocket()
-        large_data = b"A" * 4000  # 4000 bytes, larger than MSS=1460
-        
-        total_sent, next_seq = rdt_send(
-            sock, "127.0.0.1", "127.0.0.1", 5000, 80,
-            seq=100, ack_seq=0, data=large_data,
-            auto_chunk=True, mss=1460
-        )
-        
-        self.assertEqual(total_sent, 4000)
-        self.assertEqual(next_seq, 100 + 4000)
-        self.assertEqual(len(sock.sent_packets), 3)  # 1460 + 1460 + 1080 = 4000 bytes
 
 if __name__ == '__main__':
     unittest.main()

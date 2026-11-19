@@ -9,6 +9,7 @@ from streaprous_socket.streaprous_packet_dispatcher import get_packet_queue, rem
 from streaprous_socket.streaprous_flow_control import (
     RCV_BUF, flow, usable, probe_gave_up, should_probe, PROBE_INTERVAL, current_rwnd, classify, rwnd
 )
+from streaprous_socket.streaprous_congestion_control import CubicController
 from collections import deque
 
 import socket
@@ -16,7 +17,8 @@ import struct
 import time
 import queue
 from collections import namedtuple
-reorder_buffers = {} 
+reorder_buffers = {}
+congestion = {}         # one CUBIC controller per connection, kept between sends
 def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
         payload, auto_chunk=True, mss=1460, flags=0x18, rcv_wnd=RCV_BUF):
     """sends data reliably over a TCP-like connection using a custom implementation of the TCP protocol.
@@ -46,6 +48,7 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
     send_queue = deque() 
     oldest_unacked= seq
     key = (dest_ip, dst_port)
+    cc = congestion.setdefault(key, CubicController(mss=mss))
     offset = 0
     offset_res = (5 << 4) + 0
     urg_ptr = 0
@@ -62,7 +65,8 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
     dup_acks = 0
     deadline = time.time() + timeout
     while offset < len(data_mv) or send_queue:                             
-        can = usable(flow[key]["peer_rwnd"], float("inf"), current_seq, oldest_unacked)
+        cwnd = int(cc.cwnd) // mss * mss       # whole packets only, avoids tiny segments
+        can = usable(flow[key]["peer_rwnd"], cwnd, current_seq, oldest_unacked)
         if can == 0 and not send_queue: 
             st = flow[key]
             while st["peer_rwnd"] == 0:
@@ -115,6 +119,7 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
                 print(f"[Streap_RDT] Timeout for seq={send_queue[0][0]}, resending...")
                 dup_acks = 0
                 sock.sendto(send_queue[0][1], (dest_ip, 0))
+                cc.on_loss()
                 retries += 1
                 deadline = time.time() + timeout
                 continue                                   # timer ran out
@@ -129,6 +134,7 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
                 while send_queue and send_queue[0][0]+send_queue[0][2] <= tcp['ack_seq']: 
                     send_queue.popleft()
                 retries = 0
+                cc.on_ack(acked_bytes=tcp['ack_seq'] - oldest_unacked)
                 oldest_unacked = tcp['ack_seq']
                 dup_acks = 0
                 deadline = time.time() + timeout
@@ -139,6 +145,7 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
                 if dup_acks == 3:
                     print(f"[Streap_RDT] 3 dup ACKs for seq={send_queue[0][0]}, fast retransmit")
                     sock.sendto(send_queue[0][1], (dest_ip, 0))
+                    cc.on_loss()
                     deadline = time.time() + timeout
                     continue
 
