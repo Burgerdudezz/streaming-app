@@ -1,3 +1,5 @@
+from turtle import done
+
 from streaprous_socket.streaprous_raw_connection import (
     connections, connections_lock, build_tcp_packet, build_ip_header, conn_struct
 )
@@ -61,6 +63,11 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
         return build_ip_header(src_ip, dest_ip, socket.IPPROTO_TCP, len(hdr) + len(data)) + hdr + data
 
     timeout = 1.0  # Timeout in second
+    estimated_rtt = None
+    dev_rtt = None
+
+    alpha = 0.125
+    beta = 0.25
     retries = 0
     dup_acks = 0
     deadline = time.time() + timeout
@@ -103,7 +110,8 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
             
             full_packet = make_segment(current_seq, chunk_bytes)
             sock.sendto(full_packet, (dest_ip, 0))
-            send_queue.append((current_seq,full_packet, len(chunk_bytes)))
+            send_time = time.time()
+            send_queue.append((current_seq, full_packet, len(chunk_bytes), send_time))
             total_sent += len(chunk_bytes)
             current_seq += len(chunk_bytes)
 
@@ -119,6 +127,7 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
                 print(f"[Streap_RDT] Timeout for seq={send_queue[0][0]}, resending...")
                 dup_acks = 0
                 sock.sendto(send_queue[0][1], (dest_ip, 0))
+                send_queue[0] = (send_queue[0][0], send_queue[0][1], send_queue[0][2], None)
                 cc.on_loss()
                 retries += 1
                 deadline = time.time() + timeout
@@ -131,8 +140,21 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
             st["unanswered_probes"] = 0
                         
             if tcp['ack_seq'] > oldest_unacked:      # client acked some data
+                popped = None
                 while send_queue and send_queue[0][0]+send_queue[0][2] <= tcp['ack_seq']: 
-                    send_queue.popleft()
+                    popped=send_queue.popleft()
+                if  popped is not None and popped[3] is not None:  
+                    sample_rtt = time.time() - popped[3]
+                else:
+                    sample_rtt = None 
+                if sample_rtt is not None:
+                    if estimated_rtt is None:
+                        estimated_rtt = sample_rtt
+                        dev_rtt = sample_rtt / 2
+                    else:
+                        dev_rtt = (1 - beta) * dev_rtt + beta * abs(sample_rtt - estimated_rtt)
+                        estimated_rtt = (1 - alpha) * estimated_rtt + alpha * sample_rtt
+                    timeout = max(0.2, estimated_rtt + 4 * dev_rtt)
                 retries = 0
                 cc.on_ack(acked_bytes=tcp['ack_seq'] - oldest_unacked)
                 oldest_unacked = tcp['ack_seq']
@@ -145,6 +167,7 @@ def reliable_send( sock, src_ip, dest_ip, src_port, dst_port, seq, ack_seq,
                 if dup_acks == 3:
                     print(f"[Streap_RDT] 3 dup ACKs for seq={send_queue[0][0]}, fast retransmit")
                     sock.sendto(send_queue[0][1], (dest_ip, 0))
+                    send_queue[0] = (send_queue[0][0], send_queue[0][1], send_queue[0][2], None)
                     cc.on_loss()
                     deadline = time.time() + timeout
                     continue
